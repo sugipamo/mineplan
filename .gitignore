@@ -1,0 +1,10 @@
+/target/
+/memory_viewer/target/
+/experiments/target/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+**/blicket_llm_result.json
+.env
+.env.*
+!.env.example

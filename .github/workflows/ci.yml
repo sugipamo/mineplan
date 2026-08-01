@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check formatting
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path memory_viewer/Cargo.toml --check
+          cargo fmt --manifest-path experiments/Cargo.toml --check
+      - name: Test memory server
+        run: cargo test
+      - name: Test memory viewer
+        run: cargo test --manifest-path memory_viewer/Cargo.toml
+      - name: Test experiments
+        run: cargo test --manifest-path experiments/Cargo.toml

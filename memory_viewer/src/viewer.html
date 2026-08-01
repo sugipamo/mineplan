@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thought Memory Viewer</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#111827; color:#e5e7eb; }
+  body { max-width: 960px; margin: 0 auto; padding: 2rem 1rem 4rem; }
+  header, .controls, .thought { border: 1px solid #374151; border-radius: .6rem; padding: 1rem; background:#1f2937; }
+  .controls { margin: 1rem 0; display:flex; gap:.7rem; align-items:center; flex-wrap:wrap; }
+  select, button { color:inherit; background:#111827; border:1px solid #4b5563; border-radius:.35rem; padding:.5rem; }
+  button { cursor:pointer; } #status, .muted { color:#9ca3af; } #anchors { color:#93c5fd; }
+  .thought { margin:.75rem 0; } h1 { margin-top:0; } h2 { margin-top:1.8rem; } ul { margin:.5rem 0; padding-left:1.3rem; }
+</style>
+<body>
+  <header><h1>Thought Memory</h1><p>エージェントが記録した記憶を、読み取り専用で表示します。</p></header>
+  <div class="controls"><label>記憶 <select id="memory"></select></label><button id="refresh">更新</button><span id="status"></span></div>
+  <section><h2>現在の中心</h2><p id="anchors" class="muted">記憶を選択してください。</p></section>
+  <section><h2>現在の文脈</h2><div id="thoughts"></div></section>
+  <section><h2>全履歴</h2><div id="history"></div></section>
+<script>
+const memory = document.querySelector('#memory');
+const status = document.querySelector('#status');
+const anchors = document.querySelector('#anchors');
+const thoughts = document.querySelector('#thoughts');
+const historyView = document.querySelector('#history');
+const requestedMemory = new URLSearchParams(location.search).get('memory_id');
+async function json(url) { const r = await fetch(url); if (!r.ok) throw new Error((await r.json()).error || r.statusText); return r.json(); }
+function text(el, value) { el.textContent = value; }
+function renderThought(thought) {
+  const card = document.createElement('article'); card.className = 'thought';
+  const title = document.createElement('strong'); text(title, thought.id); card.append(title);
+  const from = document.createElement('p'); from.className = 'muted'; text(from, `連想元: ${thought.associated_from.length ? thought.associated_from.join(', ') : 'なし'}`); card.append(from);
+  const list = document.createElement('ul');
+  for (const premise of thought.premises) { const item = document.createElement('li'); text(item, premise.content); list.append(item); }
+  if (!thought.premises.length) { const item=document.createElement('li'); text(item, '前提なし'); list.append(item); }
+  card.append(list); return card;
+}
+async function refresh() {
+  status.textContent = '取得中…';
+  try {
+    const memories = await json('/api/memories'); const previous = memory.value;
+    memory.replaceChildren();
+    for (const id of memories.memory_ids) { const option=document.createElement('option'); option.value=id; text(option,id); memory.append(option); }
+    if (memories.memory_ids.includes(previous)) memory.value=previous;
+    else if (memories.memory_ids.includes(requestedMemory)) memory.value=requestedMemory;
+    if (!memory.value) { anchors.textContent='保存された記憶はありません。'; thoughts.replaceChildren(); historyView.replaceChildren(); status.textContent=''; return; }
+    const id = encodeURIComponent(memory.value);
+    const [context, allThoughts] = await Promise.all([json(`/api/memories/${id}/context`), json(`/api/memories/${id}/thoughts`)]);
+    anchors.textContent = context.active_set.length ? context.active_set.join(' → ') : 'active_set は空です。';
+    thoughts.replaceChildren(...context.thoughts.map(renderThought));
+    if (!context.thoughts.length) thoughts.innerHTML='<p class="muted">文脈はありません。</p>';
+    historyView.replaceChildren(...allThoughts.thoughts.map(renderThought));
+    if (!allThoughts.thoughts.length) historyView.innerHTML='<p class="muted">Thought はありません。</p>';
+    const url = new URL(location); url.searchParams.set('memory_id', memory.value); window.history.replaceState(null, '', url);
+    status.textContent = `更新: ${new Date().toLocaleTimeString()}`;
+  } catch (error) { status.textContent=`取得失敗: ${error.message}`; }
+}
+memory.addEventListener('change', refresh); document.querySelector('#refresh').addEventListener('click', refresh); refresh(); setInterval(refresh, 3000);
+</script>
+</body></html>

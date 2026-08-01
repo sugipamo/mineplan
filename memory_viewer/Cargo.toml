@@ -1,0 +1,14 @@
+[package]
+name = "memory_viewer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# This Viewer is intentionally an independent Rust project, not a member of
+# the parent memory-server workspace.
+[workspace]
+
+[dependencies]
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
