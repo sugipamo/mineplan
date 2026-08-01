@@ -69,6 +69,10 @@ Thought は追記専用です。観測・行動・解釈は区別せず、`premi
 - [`memory_viewer/`](./memory_viewer/README.md) — 記憶を読み取り専用で表示する独立 Rust プロジェクト
 - [`experiments/`](./experiments/README.md) — Blicket 環境と LLM 比較を置く独立 Rust プロジェクト。本体サーバーの依存には含まれません
 
+## License
+
+[MIT License](./LICENSE) で公開します。
+
 ## 開発
 
 ```bash
