@@ -451,11 +451,12 @@ impl ThoughtStore {
         let mut queue = VecDeque::new();
         let mut ids = Vec::new();
         for anchor in anchors {
-            if seen.insert(anchor.clone()) {
-                queue.push_back(anchor);
-            }
+            queue.push_back(anchor);
         }
         while let Some(id) = queue.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
             let hidden = merges.contains_key(&id);
             if !hidden {
                 ids.push(id.clone());
@@ -464,14 +465,10 @@ impl ThoughtStore {
                 break;
             }
             for neighbor in neighbors.get(&id).into_iter().flatten() {
-                if seen.insert(neighbor.clone()) {
-                    queue.push_back(neighbor.clone());
-                }
+                queue.push_back(neighbor.clone());
             }
             if let Some(target) = merges.get(&id) {
-                if seen.insert(target.clone()) {
-                    queue.push_front(target.clone());
-                }
+                queue.push_front(target.clone());
             }
         }
         Ok(ids
