@@ -113,6 +113,12 @@ fn call_tool(store: &mut ThoughtStore, params: Value) -> Result<Value, (i32, Str
                 .remove_related_link(memory_id, thought_id_a, thought_id_b)
                 .map(|related_link| json!({"related_link": related_link}))
         }
+        "memory_thought_merge" => {
+            let memory_id = required_string(&arguments, "memory_id")?;
+            let source = required_string(&arguments, "source_thought_id")?;
+            let target = required_string(&arguments, "target_thought_id")?;
+            store.merge_thoughts(memory_id, source, target).map(|merge| json!({"merge": merge}))
+        }
         "memory_get_related" => {
             let memory_id = required_string(&arguments, "memory_id")?;
             let thought_id = required_string(&arguments, "thought_id")?;
@@ -238,6 +244,12 @@ fn tool_definitions() -> Vec<Value> {
             "Remove one existing undirected related link between two Thoughts.",
             json!({"memory_id":{"type":"string"},"thought_id_a":{"type":"string"},"thought_id_b":{"type":"string"}}),
             vec!["memory_id", "thought_id_a", "thought_id_b"],
+        ),
+        tool(
+            "memory_thought_merge",
+            "Hide one Thought's content while traversing its edges through another Thought at zero exploration cost.",
+            json!({"memory_id":{"type":"string"},"source_thought_id":{"type":"string"},"target_thought_id":{"type":"string"}}),
+            vec!["memory_id", "source_thought_id", "target_thought_id"],
         ),
         tool(
             "memory_get_related",

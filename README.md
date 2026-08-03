@@ -60,6 +60,7 @@ Thought は追記専用です。観測・行動・解釈は区別せず、`premi
 - `memory_get_context` — active_set から連想・関連を双方向 BFS して文脈を取得（既定 50 件）
 - `memory_get_active_set` / `memory_active_set_replace` / `memory_active_set_reorder` / `memory_active_set_add` / `memory_active_set_remove` — 現在の文脈アンカーを管理
 - `memory_related_add` / `memory_related_remove` / `memory_get_related` — Thought 間の名前なし・双方向の関連を管理・取得
+- `memory_thought_merge` — 1つの Thought を別の Thought に統合し、統合元の内容を非表示にして辺だけをコスト0で探索
 - `memory_clear` — memory_id を残し、Thought・連想・関連・active_set を削除
 
 `memory_clear` は即時削除です。SQLite ファイルのバックアップは使用者が管理します。

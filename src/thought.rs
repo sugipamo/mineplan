@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 pub const DEFAULT_CONTEXT_LIMIT: usize = 50;
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PremiseDraft {
@@ -51,6 +51,12 @@ pub struct RelatedLink {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThoughtMerge {
+    pub source_thought_id: String,
+    pub target_thought_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClearResult {
     pub memory_id: String,
     pub deleted_thoughts: usize,
@@ -85,6 +91,10 @@ pub enum ThoughtError {
     DuplicateRelated(String, String),
     #[error("related link does not exist: {0} <-> {1}")]
     MissingRelated(String, String),
+    #[error("thought merge already exists: {0} -> {1}")]
+    DuplicateMerge(String, String),
+    #[error("thought merge does not exist: {0} -> {1}")]
+    MissingMerge(String, String),
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
 }
@@ -334,6 +344,27 @@ impl ThoughtStore {
         })
     }
 
+    /// Hides the source thought in context results while keeping its edges
+    /// traversable through the target at zero exploration cost.
+    pub fn merge_thoughts(
+        &mut self,
+        memory_id: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<ThoughtMerge, ThoughtError> {
+        self.ensure_memory(memory_id)?;
+        if source == target {
+            return Err(ThoughtError::SelfRelated(source.into()));
+        }
+        self.ensure_thought(memory_id, source)?;
+        self.ensure_thought(memory_id, target)?;
+        match self.connection.execute("INSERT INTO thought_merges (memory_id, source_thought_id, target_thought_id) VALUES (?1, ?2, ?3)", params![memory_id, source, target]) {
+            Ok(_) => Ok(ThoughtMerge { source_thought_id: source.into(), target_thought_id: target.into() }),
+            Err(rusqlite::Error::SqliteFailure(error, _)) if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY => Err(ThoughtError::DuplicateMerge(source.into(), target.into())),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Returns Thoughts directly linked by `related`, newest link first.
     pub fn get_related_thoughts(
         &self,
@@ -369,6 +400,10 @@ impl ThoughtStore {
         )?;
         let deleted_related_links = transaction.execute(
             "DELETE FROM related_links WHERE memory_id = ?1",
+            params![memory_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM thought_merges WHERE memory_id = ?1",
             params![memory_id],
         )?;
         transaction.execute(
@@ -411,6 +446,7 @@ impl ThoughtStore {
             index.insert(thought.id.clone(), thought);
         }
         let neighbors = self.load_neighbors(memory_id)?;
+        let merges = self.load_merges(memory_id)?;
         let mut seen = HashSet::new();
         let mut queue = VecDeque::new();
         let mut ids = Vec::new();
@@ -420,13 +456,21 @@ impl ThoughtStore {
             }
         }
         while let Some(id) = queue.pop_front() {
-            ids.push(id.clone());
+            let hidden = merges.contains_key(&id);
+            if !hidden {
+                ids.push(id.clone());
+            }
             if ids.len() == limit {
                 break;
             }
             for neighbor in neighbors.get(&id).into_iter().flatten() {
                 if seen.insert(neighbor.clone()) {
                     queue.push_back(neighbor.clone());
+                }
+            }
+            if let Some(target) = merges.get(&id) {
+                if seen.insert(target.clone()) {
+                    queue.push_front(target.clone());
                 }
             }
         }
@@ -573,6 +617,15 @@ impl ThoughtStore {
             })
             .collect())
     }
+
+    fn load_merges(&self, memory_id: &str) -> Result<HashMap<String, String>, ThoughtError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_thought_id, target_thought_id FROM thought_merges WHERE memory_id = ?1",
+        )?;
+        Ok(statement
+            .query_map(params![memory_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<HashMap<_, _>, _>>()?)
+    }
 }
 
 fn migrate_schema(connection: &mut Connection) -> Result<(), ThoughtError> {
@@ -601,6 +654,7 @@ fn migrate_schema(connection: &mut Connection) -> Result<(), ThoughtError> {
         match next {
             1 => create_v1_schema(&transaction)?,
             2 => migrate_to_v2(&transaction)?,
+            3 => migrate_to_v3(&transaction)?,
             _ => unreachable!(),
         }
         transaction.execute(
@@ -610,6 +664,11 @@ fn migrate_schema(connection: &mut Connection) -> Result<(), ThoughtError> {
         transaction.commit()?;
         version = next;
     }
+    Ok(())
+}
+
+fn migrate_to_v3(connection: &Connection) -> Result<(), ThoughtError> {
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS thought_merges (memory_id TEXT NOT NULL REFERENCES memories(memory_id), source_thought_id TEXT NOT NULL, target_thought_id TEXT NOT NULL, PRIMARY KEY (memory_id, source_thought_id), FOREIGN KEY (memory_id, source_thought_id) REFERENCES thoughts(memory_id, thought_id), FOREIGN KEY (memory_id, target_thought_id) REFERENCES thoughts(memory_id, thought_id));")?;
     Ok(())
 }
 
@@ -920,6 +979,28 @@ mod tests {
         );
         assert_eq!(store.clear_memory("m").unwrap().deleted_thoughts, 0);
         assert_eq!(store.record_thought("m", draft(&[], &[])).unwrap().id, "T1");
+    }
+
+    #[test]
+    fn merged_source_is_hidden_but_zero_cost_edges_are_traversed() {
+        let mut store = store();
+        store.create_memory("m").unwrap();
+        store.record_thought("m", draft(&[], &["source"])).unwrap();
+        store
+            .record_thought("m", draft(&["T1"], &["middle"]))
+            .unwrap();
+        store
+            .record_thought("m", draft(&["T2"], &["target"]))
+            .unwrap();
+        store.merge_thoughts("m", "T1", "T3").unwrap();
+        store.replace_active_set("m", &["T1".into()]).unwrap();
+        let ids: Vec<_> = store
+            .get_context("m", 2)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, ["T3", "T2"]);
     }
 
     #[test]
