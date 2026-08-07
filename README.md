@@ -1,9 +1,9 @@
-# memory_server
+# mineplan
 
 エージェントが記録する Thought を SQLite に保存し、localhost の HTTP MCP として公開する Rust サーバーです。Thought は過去を上書きせず、現在重視している Thought は `active_set` で管理します。
 
 ```text
-エージェント ── HTTP MCP ── memory_server ── SQLite
+エージェント ── HTTP MCP ── mineplan ── SQLite
                                 ↑
 memory_viewer ── 読み取り API ┘
 ```
@@ -12,10 +12,10 @@ memory_viewer ── 読み取り API ┘
 
 ## 起動
 
-Rust の安定版を用意し、リポジトリ直下で実行します。
+リリースページから実行環境に合う `mineplan` バイナリを取得し、配置して実行します。Rust のインストールは不要です。
 
 ```bash
-MEMORY_DB_PATH=./memory.sqlite3 cargo run
+./mineplan
 ```
 
 既定の接続先は次のとおりです。
@@ -37,7 +37,7 @@ MEMORY_DB_PATH=./memory.sqlite3 cargo run
 サーバーの bind 先は常に `127.0.0.1` です。
 
 ```bash
-MEMORY_DB_PATH=./data/agent.sqlite3 MEMORY_HTTP_PORT=3001 cargo run
+MEMORY_DB_PATH=./data/agent.sqlite3 MEMORY_HTTP_PORT=3001 ./mineplan
 ```
 
 ## HTTP エンドポイント
@@ -77,7 +77,7 @@ Thought は追記専用です。観測・行動・解釈は区別せず、`premi
 ## 開発
 
 ```bash
-# memory_server
+# mineplan
 cargo test
 
 # Viewer

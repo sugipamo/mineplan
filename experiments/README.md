@@ -1,6 +1,6 @@
 # memory_experiments
 
-`memory_experiments` は、記憶サーバー本体から切り離された Blicket 検証・LLM 実験プロジェクトです。`memory_server` の Thought ストアをライブラリとして利用しますが、HTTP MCP サーバーには含まれません。通常の記憶サーバー運用では起動不要です。
+`memory_experiments` は、記憶サーバー本体から切り離された Blicket 検証・LLM 実験プロジェクトです。`mineplan` の Thought ストアをライブラリとして利用しますが、HTTP MCP サーバーには含まれません。通常の mineplan 運用では起動不要です。
 
 以下はリポジトリ直下から実行します。
 

@@ -1,0 +1,57 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive: mineplan-linux-x86_64.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            archive: mineplan-linux-aarch64.tar.gz
+          - target: x86_64-apple-darwin
+            archive: mineplan-macos-x86_64.tar.gz
+          - target: aarch64-apple-darwin
+            archive: mineplan-macos-aarch64.tar.gz
+          - target: x86_64-pc-windows-gnu
+            archive: mineplan-windows-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - run: cross build --release --target ${{ matrix.target }}
+      - name: Package Unix binary
+        if: runner.os == 'Linux' && !contains(matrix.target, 'windows')
+        run: tar -czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release mineplan
+      - name: Package Windows binary
+        if: contains(matrix.target, 'windows')
+        run: zip ${{ matrix.archive }} target/${{ matrix.target }}/release/mineplan.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
