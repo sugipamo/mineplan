@@ -5,12 +5,26 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  preflight:
+    name: Test release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Test mineplan
+        run: cargo test
+
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -25,7 +39,7 @@ jobs:
             cross: true
           - target: x86_64-apple-darwin
             archive: mineplan-macos-x86_64.tar.gz
-            runner: macos-13
+            runner: macos-15-intel
             cross: false
           - target: aarch64-apple-darwin
             archive: mineplan-macos-aarch64.tar.gz
@@ -35,9 +49,8 @@ jobs:
             archive: mineplan-windows-x86_64.zip
             runner: ubuntu-latest
             cross: true
-    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -64,6 +77,9 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:

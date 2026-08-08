@@ -36,8 +36,7 @@
       "after": "棒を作る",
       "reason": "棒の材料として板材を使うため"
     }
-  ],
-  "truncated": false
+  ]
 }
 ```
 
@@ -103,10 +102,9 @@ LLM向けMCPはこの4ツールだけを公開します。利用する記憶は�
 - limit途中で循環が切れた場合、見えている範囲だけでbefore／focus／afterを分類します。
 - limitを増やすと、遠くの戻り辺が見えてSCC分類が変わることがあります。
 - `connections` も独立して最大limit件です。
-- メモまたは辺に続きがあれば `truncated: true` を返します。
 - 明示フォーカスの件数自体がlimitを超える場合はエラーです。
 
-MCP応答はLLMがそのまま読む前提で、JSONを `content` に一度だけ返します。書き込み結果は `added`、または `changed` と `merged` のみに絞り、`memory_focus` は `before`、`focus`、`after`、`connections`、`truncated` のみを返します。
+MCP応答はLLMがそのまま読む前提で、JSONを `content` に一度だけ返します。書き込み結果は `added`、または `changed` と `merged` のみに絞り、`memory_focus` は `before`、`focus`、`after`、`connections` のみを返します。limitによる省略は通常動作として扱い、完全取得かどうかを示すフラグは返しません。
 
 ## DBマイグレーション
 

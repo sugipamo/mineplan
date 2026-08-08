@@ -93,8 +93,7 @@ fn call_tool(
                     "before": view.before,
                     "focus": view.focus,
                     "after": view.after,
-                    "connections": view.connections,
-                    "truncated": view.truncated
+                    "connections": view.connections
                 })
             })
         }
@@ -229,7 +228,7 @@ mod tests {
         assert_eq!(view["focus"], json!([["中心"]]));
         assert_eq!(view["after"], json!([["後続"]]));
         assert_eq!(view["connections"].as_array().unwrap().len(), 2);
-        assert_eq!(view["truncated"], false);
+        assert!(view.get("truncated").is_none());
         assert!(view.get("memory_id").is_none());
         assert!(view.get("limit").is_none());
     }
