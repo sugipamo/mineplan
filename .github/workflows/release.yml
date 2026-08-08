@@ -45,10 +45,6 @@ jobs:
             archive: mineplan-macos-aarch64.tar.gz
             runner: macos-14
             cross: false
-          - target: x86_64-pc-windows-gnu
-            archive: mineplan-windows-x86_64.zip
-            runner: ubuntu-latest
-            cross: true
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -64,12 +60,8 @@ jobs:
       - name: Build natively
         if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Package Unix binary
-        if: ${{ !contains(matrix.target, 'windows') }}
+      - name: Package binary
         run: tar -czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release mineplan
-      - name: Package Windows binary
-        if: contains(matrix.target, 'windows')
-        run: zip ${{ matrix.archive }} target/${{ matrix.target }}/release/mineplan.exe
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}
