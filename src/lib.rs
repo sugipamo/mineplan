@@ -1,4 +1,4 @@
-//! Persistent Thought memory exposed through a localhost HTTP MCP server.
+//! mineplan: persistent ordered memory exposed through a localhost HTTP MCP server.
 
 pub mod mcp;
-pub mod thought;
+pub mod ordered_memory;

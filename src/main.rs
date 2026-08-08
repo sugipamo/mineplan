@@ -1,50 +1,164 @@
-//! Local HTTP transport and read-only inspector for Thought memory.
+//! Local HTTP transport for ordered memory.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::{Json, Router};
 use mineplan::mcp;
-use mineplan::thought::{DEFAULT_CONTEXT_LIMIT, ThoughtStore};
-use serde::Deserialize;
+use mineplan::ordered_memory::MemoryStore;
 use serde_json::{Value, json};
 use std::env;
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Mutex<ThoughtStore>>,
-}
-
-#[derive(Deserialize)]
-struct ContextQuery {
-    limit: Option<usize>,
+    store: Arc<Mutex<MemoryStore>>,
+    memory_id: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    let database_path = env::var("MEMORY_DB_PATH").unwrap_or_else(|_| "memory.sqlite3".into());
+    let database_path = env::var("MEMORY_DB_PATH").unwrap_or_else(|_| "mineplan.sqlite3".into());
+    let memory_id = env::var("MEMORY_ID").unwrap_or_else(|_| "default".into());
+    let command = parse_command(env::args().skip(1).collect())
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    match command {
+        Command::Serve => serve(&database_path, &memory_id).await,
+        Command::Help => {
+            println!("{}", help_text());
+            Ok(())
+        }
+        Command::ClearMemory { memory_id, confirm } => {
+            clear_memory_command(&database_path, &memory_id, confirm.as_deref())
+        }
+    }
+}
+
+async fn serve(database_path: &str, memory_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let port = env::var("MEMORY_HTTP_PORT").map_or(Ok(3000), |value| value.parse::<u16>())?;
     let bind = format!("127.0.0.1:{port}");
+    let mut store = MemoryStore::open(database_path)?;
+    store.create_memory_if_missing(memory_id)?;
     let state = AppState {
-        store: Arc::new(Mutex::new(ThoughtStore::open(&database_path)?)),
+        store: Arc::new(Mutex::new(store)),
+        memory_id: memory_id.into(),
     };
-    let app = app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    eprintln!("Thought memory HTTP server: http://{bind}");
-    eprintln!("WebUI: http://{bind}/  MCP: http://{bind}/mcp");
-    axum::serve(listener, app).await?;
+    eprintln!("mineplan HTTP server: http://{bind}");
+    eprintln!("MCP: http://{bind}/mcp");
+    eprintln!("memory: {memory_id}");
+    axum::serve(listener, app(state)).await?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Serve,
+    Help,
+    ClearMemory {
+        memory_id: String,
+        confirm: Option<String>,
+    },
+}
+
+fn parse_command(arguments: Vec<String>) -> Result<Command, String> {
+    if arguments.is_empty() {
+        return Ok(Command::Serve);
+    }
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("help" | "--help" | "-h")
+    ) {
+        return if arguments.len() == 1 {
+            Ok(Command::Help)
+        } else {
+            Err(usage("help takes no arguments"))
+        };
+    }
+    if arguments.first().map(String::as_str) != Some("clear-memory") {
+        return Err(usage(format!("unknown command: {}", arguments[0])));
+    }
+    let mut memory_id = None;
+    let mut confirm = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| usage(format!("{flag} requires a value")))?;
+        match flag.as_str() {
+            "--memory-id" if memory_id.is_none() => memory_id = Some(value.clone()),
+            "--confirm" if confirm.is_none() => confirm = Some(value.clone()),
+            "--memory-id" | "--confirm" => {
+                return Err(usage(format!("duplicate option: {flag}")));
+            }
+            _ => return Err(usage(format!("unknown option: {flag}"))),
+        }
+        index += 2;
+    }
+    let memory_id = memory_id.ok_or_else(|| usage("--memory-id is required"))?;
+    if memory_id.trim().is_empty() {
+        return Err(usage("--memory-id must not be empty"));
+    }
+    Ok(Command::ClearMemory { memory_id, confirm })
+}
+
+fn clear_memory_command(
+    database_path: &str,
+    memory_id: &str,
+    confirmation: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let confirmed = match confirmation {
+        Some(value) => value.to_string(),
+        None => {
+            eprintln!("memory \"{memory_id}\" の全メモと辺を物理削除します。");
+            eprintln!("この操作は取り消せません。");
+            eprint!("続行するには memory_id を再入力してください: ");
+            io::stderr().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            input.trim_end_matches(['\r', '\n']).to_string()
+        }
+    };
+    if confirmed != memory_id {
+        return Err(format!(
+            "confirmation did not match memory_id; nothing was deleted: {memory_id}"
+        )
+        .into());
+    }
+    let mut store = MemoryStore::open(database_path)?;
+    let result = store.clear_memory(memory_id)?;
+    println!(
+        "cleared memory {}: {} notes, {} orders deleted",
+        result.memory_id, result.deleted_notes, result.deleted_orders
+    );
+    Ok(())
+}
+
+fn usage(message: impl AsRef<str>) -> String {
+    format!("{}\n\n{}", message.as_ref(), help_text())
+}
+
+fn help_text() -> &'static str {
+    "mineplan MCP server
+
+USAGE:
+  mineplan
+  mineplan clear-memory --memory-id <id> [--confirm <id>]
+  mineplan help
+
+ENVIRONMENT:
+  MEMORY_ID         Memory used by MCP tools (default: default)
+  MEMORY_DB_PATH    SQLite database path (default: mineplan.sqlite3)
+  MEMORY_HTTP_PORT  Local HTTP port (default: 3000)"
 }
 
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/mcp", post(mcp_post).get(mcp_get))
-        .route("/api/memories", get(list_memories))
-        .route("/api/memories/{memory_id}/context", get(get_context))
-        .route("/api/memories/{memory_id}/thoughts", get(list_thoughts))
         .with_state(state)
 }
 
@@ -53,34 +167,16 @@ async fn mcp_post(
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Response {
-    if !origin_is_allowed(&headers, &state) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let response = match state.store.lock() {
-        Ok(mut store) => mcp::handle_json_request(&mut store, &request.to_string()),
-        Err(_) => {
-            json!({"jsonrpc":"2.0","id":Value::Null,"error":{"code":-32603,"message":"memory store lock poisoned"}})
-        }
-    };
-    ([(header::CONTENT_TYPE, "application/json")], Json(response)).into_response()
-}
-
-async fn mcp_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !origin_is_allowed(&headers, &state) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    StatusCode::METHOD_NOT_ALLOWED.into_response()
-}
-
-async fn list_memories(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !origin_is_allowed(&headers, &state) {
+    if !origin_is_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
     match state.store.lock() {
-        Ok(store) => match store.list_memory_ids() {
-            Ok(memory_ids) => Json(json!({"memory_ids": memory_ids})).into_response(),
-            Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-        },
+        Ok(mut store) => Json(mcp::handle_json_request(
+            &mut store,
+            &state.memory_id,
+            &request.to_string(),
+        ))
+        .into_response(),
         Err(_) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "memory store lock poisoned",
@@ -88,61 +184,19 @@ async fn list_memories(State(state): State<AppState>, headers: HeaderMap) -> Res
     }
 }
 
-async fn get_context(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(memory_id): Path<String>,
-    Query(query): Query<ContextQuery>,
-) -> Response {
-    if !origin_is_allowed(&headers, &state) {
+async fn mcp_get(headers: HeaderMap) -> Response {
+    if !origin_is_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let limit = query.limit.unwrap_or(DEFAULT_CONTEXT_LIMIT);
-    let result: Result<_, String> = match state.store.lock() {
-        Ok(store) => (|| {
-            let active_set = store
-                .get_active_set(&memory_id)
-                .map_err(|error| error.to_string())?;
-            let thoughts = store
-                .get_context(&memory_id, limit)
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>((active_set, thoughts))
-        })(),
-        Err(_) => Err("memory store lock poisoned".into()),
-    };
-    match result {
-        Ok((active_set, thoughts)) => Json(json!({"memory_id": memory_id, "active_set": active_set.anchor_ids, "thoughts": thoughts})).into_response(),
-        Err(error) => api_error(StatusCode::NOT_FOUND, &error),
-    }
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
 }
 
-async fn list_thoughts(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(memory_id): Path<String>,
-) -> Response {
-    if !origin_is_allowed(&headers, &state) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let result: Result<_, String> = match state.store.lock() {
-        Ok(store) => store
-            .list_thoughts(&memory_id)
-            .map_err(|error| error.to_string()),
-        Err(_) => Err("memory store lock poisoned".into()),
-    };
-    match result {
-        Ok(thoughts) => Json(json!({"memory_id": memory_id, "thoughts": thoughts})).into_response(),
-        Err(error) => api_error(StatusCode::NOT_FOUND, &error),
-    }
-}
-
-fn origin_is_allowed(headers: &HeaderMap, state: &AppState) -> bool {
-    let _ = state;
+fn origin_is_allowed(headers: &HeaderMap) -> bool {
     headers.get(header::ORIGIN).is_none()
 }
 
 fn api_error(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({"error": message}))).into_response()
+    (status, Json(json!({"error":message}))).into_response()
 }
 
 #[cfg(test)]
@@ -152,9 +206,23 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    fn temporary_database_path() -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "mineplan-cli-test-{}-{unique}.sqlite3",
+            std::process::id()
+        ))
+    }
+
     fn test_app() -> Router {
+        let mut store = MemoryStore::open(":memory:").unwrap();
+        store.create_memory("default").unwrap();
         app(AppState {
-            store: Arc::new(Mutex::new(ThoughtStore::open(":memory:").unwrap())),
+            store: Arc::new(Mutex::new(store)),
+            memory_id: "default".into(),
         })
     }
 
@@ -174,70 +242,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_mcp_and_read_only_context_share_one_store() {
+    async fn mcp_uses_the_server_configured_memory_without_an_id_argument() {
         let app = test_app();
-        for (id, name, arguments) in [
-            (1, "memory_create", json!({"memory_id":"m"})),
-            (
-                2,
-                "memory_record_thought",
-                json!({"memory_id":"m","premises":["記録された前提"]}),
-            ),
-            (
-                3,
-                "memory_active_set_add",
-                json!({"memory_id":"m","thought_id":"T1"}),
-            ),
-        ] {
-            assert_eq!(
-                call(&app, mcp_request(id, name, arguments)).await.status(),
-                StatusCode::OK
-            );
-        }
         let response = call(
             &app,
-            Request::builder()
-                .uri("/api/memories/m/context")
-                .body(Body::empty())
-                .unwrap(),
+            mcp_request(
+                1,
+                "order_add",
+                json!({"before":"前","after":"後","reason":"時系列として前後"}),
+            ),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["active_set"],
-            json!(["T1"])
-        );
         let response = call(
             &app,
-            Request::builder()
-                .uri("/api/memories/m/thoughts")
-                .body(Body::empty())
-                .unwrap(),
+            mcp_request(2, "memory_focus", json!({"focus":["後"]})),
         )
         .await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["thoughts"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        let output: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(output["before"], json!([["前"]]));
     }
 
     #[tokio::test]
     async fn browser_requests_from_another_origin_are_rejected() {
-        let app = test_app();
         let response = call(
-            &app,
+            &test_app(),
             Request::builder()
-                .uri("/api/memories")
+                .uri("/mcp")
                 .header(header::ORIGIN, "http://example.test")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn parses_server_and_clear_memory_commands() {
+        assert_eq!(parse_command(vec![]).unwrap(), Command::Serve);
+        assert_eq!(parse_command(vec!["--help".into()]).unwrap(), Command::Help);
+        assert!(help_text().contains("MEMORY_ID"));
+        assert_eq!(
+            parse_command(vec![
+                "clear-memory".into(),
+                "--memory-id".into(),
+                "minecraft".into(),
+                "--confirm".into(),
+                "minecraft".into(),
+            ])
+            .unwrap(),
+            Command::ClearMemory {
+                memory_id: "minecraft".into(),
+                confirm: Some("minecraft".into()),
+            }
+        );
+        assert!(parse_command(vec!["clear-memory".into()]).is_err());
+    }
+
+    #[test]
+    fn cli_confirmation_must_match_before_memory_is_cleared() {
+        let path = temporary_database_path();
+        {
+            let mut store = MemoryStore::open(&path).unwrap();
+            store.create_memory("minecraft").unwrap();
+            store.add_note("minecraft", "残すメモ").unwrap();
+        }
+        assert!(clear_memory_command(path.to_str().unwrap(), "minecraft", Some("wrong")).is_err());
+        assert_eq!(
+            MemoryStore::open(&path)
+                .unwrap()
+                .get_memory("minecraft")
+                .unwrap()
+                .notes,
+            ["残すメモ"]
+        );
+        clear_memory_command(path.to_str().unwrap(), "minecraft", Some("minecraft")).unwrap();
+        assert!(
+            MemoryStore::open(&path)
+                .unwrap()
+                .get_memory("minecraft")
+                .unwrap()
+                .notes
+                .is_empty()
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }
