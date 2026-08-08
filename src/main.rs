@@ -31,6 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", help_text());
             Ok(())
         }
+        Command::Version => {
+            println!("mineplan {}", env!("MINEPLAN_BUILD_VERSION"));
+            Ok(())
+        }
         Command::ClearMemory { memory_id, confirm } => {
             clear_memory_command(&database_path, &memory_id, confirm.as_deref())
         }
@@ -58,6 +62,7 @@ async fn serve(database_path: &str, memory_id: &str) -> Result<(), Box<dyn std::
 enum Command {
     Serve,
     Help,
+    Version,
     ClearMemory {
         memory_id: String,
         confirm: Option<String>,
@@ -76,6 +81,16 @@ fn parse_command(arguments: Vec<String>) -> Result<Command, String> {
             Ok(Command::Help)
         } else {
             Err(usage("help takes no arguments"))
+        };
+    }
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("version" | "--version" | "-V")
+    ) {
+        return if arguments.len() == 1 {
+            Ok(Command::Version)
+        } else {
+            Err(usage("version takes no arguments"))
         };
     }
     if arguments.first().map(String::as_str) != Some("clear-memory") {
@@ -149,6 +164,7 @@ USAGE:
   mineplan
   mineplan clear-memory --memory-id <id> [--confirm <id>]
   mineplan help
+  mineplan version
 
 ENVIRONMENT:
   MEMORY_ID         Memory used by MCP tools (default: default)
@@ -285,6 +301,12 @@ mod tests {
     fn parses_server_and_clear_memory_commands() {
         assert_eq!(parse_command(vec![]).unwrap(), Command::Serve);
         assert_eq!(parse_command(vec!["--help".into()]).unwrap(), Command::Help);
+        assert_eq!(
+            parse_command(vec!["--version".into()]).unwrap(),
+            Command::Version
+        );
+        assert_eq!(parse_command(vec!["-V".into()]).unwrap(), Command::Version);
+        assert!(parse_command(vec!["-v".into()]).is_err());
         assert!(help_text().contains("MEMORY_ID"));
         assert_eq!(
             parse_command(vec![

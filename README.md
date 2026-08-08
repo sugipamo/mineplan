@@ -141,6 +141,15 @@ cargo run
 cargo run -- --help
 ```
 
+バイナリのバージョンは `--version` または `-V` で確認できます。
+
+```bash
+mineplan --version
+# mineplan v0.2.1
+```
+
+リリースバイナリにはビルド対象のGitタグを埋め込みます。ローカルビルドでは `git describe --tags --always --dirty` の結果を表示し、Git情報が利用できない場合だけCargoのパッケージバージョンへフォールバックします。
+
 ## 記憶の物理削除
 
 記憶の削除はMCPに公開されません。運用者だけがCLIから実行できます。`memory_id` は残り、その中のメモと辺が物理削除されます。

@@ -25,6 +25,8 @@ jobs:
     needs: preflight
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      MINEPLAN_BUILD_VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
