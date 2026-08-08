@@ -17,25 +17,42 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             archive: mineplan-linux-x86_64.tar.gz
+            runner: ubuntu-latest
+            cross: true
           - target: aarch64-unknown-linux-gnu
             archive: mineplan-linux-aarch64.tar.gz
+            runner: ubuntu-latest
+            cross: true
           - target: x86_64-apple-darwin
             archive: mineplan-macos-x86_64.tar.gz
+            runner: macos-13
+            cross: false
           - target: aarch64-apple-darwin
             archive: mineplan-macos-aarch64.tar.gz
+            runner: macos-14
+            cross: false
           - target: x86_64-pc-windows-gnu
             archive: mineplan-windows-x86_64.zip
+            runner: ubuntu-latest
+            cross: true
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@v2
+        if: matrix.cross
         with:
           tool: cross
-      - run: cross build --release --target ${{ matrix.target }}
+      - name: Build with cross
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+      - name: Build natively
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
       - name: Package Unix binary
-        if: runner.os == 'Linux' && !contains(matrix.target, 'windows')
+        if: ${{ !contains(matrix.target, 'windows') }}
         run: tar -czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release mineplan
       - name: Package Windows binary
         if: contains(matrix.target, 'windows')
