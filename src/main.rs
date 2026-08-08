@@ -169,7 +169,11 @@ USAGE:
 ENVIRONMENT:
   MEMORY_ID         Memory used by MCP tools (default: default)
   MEMORY_DB_PATH    SQLite database path (default: mineplan.sqlite3)
-  MEMORY_HTTP_PORT  Local HTTP port (default: 3000)"
+  MEMORY_HTTP_PORT  Local HTTP port (default: 3000)
+
+MCP:
+  POST http://127.0.0.1:3000/mcp
+  Tools: node_add, node_update, edge_add, edge_update, edge_delete, memory_focus"
 }
 
 fn app(state: AppState) -> Router {
@@ -264,8 +268,8 @@ mod tests {
             &app,
             mcp_request(
                 1,
-                "order_add",
-                json!({"before":"前","after":"後","reason":"時系列として前後"}),
+                "edge_add",
+                json!({"before":"前","after":"後","edge_name":"時系列として前後"}),
             ),
         )
         .await;

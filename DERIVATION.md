@@ -23,7 +23,7 @@
 | 旧mineplan | 現mineplan |
 | --- | --- |
 | Thoughtとpremise | 本文自体を識別子とする自由文note |
-| 無向の文脈探索 | `before + after + reason` で識別する有向の前後関係 |
+| 無向の文脈探索 | 永続 `edge_id` と `edge_name` を持つ有向の前後関係 |
 | active_setを起点にBFS | 呼び出し時の複数focusから最大limit件を双方向探索 |
 | 近傍のThought一覧 | ローカルSCCによる二重配列のbefore / focus / after表示 |
 | Thought merge | String ID変更と既存ノードへの統合 |
@@ -38,6 +38,6 @@
 
 旧 `src/thought.rs`、`memory_viewer`、`experiments` は、現在のAPIと両立しないため削除しました。必要な由来情報はこの文書とライセンスに残しています。
 
-現mineplanはタスク管理を行いません。前後欄に表示されたメモが完了済み、予定済み、または真であるとは解釈しません。
+現mineplanはタスク管理を行いません。前後欄に表示されたノードが完了済み、予定済み、または真であるとは解釈しません。辺は同じ端点・同じedge_nameでも重複登録でき、edge_idで個別に更新・削除できます。
 
 記憶の物理削除は通常のMCP操作から外し、対象 `memory_id` の一致確認を要求するCLI管理操作に限定しています。
