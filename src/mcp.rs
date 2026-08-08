@@ -60,6 +60,11 @@ fn call_tool(store: &mut ThoughtStore, params: Value) -> Result<Value, (i32, Str
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if name == "memory_help" {
+        let topic = arguments.get("topic").and_then(Value::as_str);
+        let text = help_text(topic)?;
+        return Ok(json!({"topic": topic.unwrap_or("overview"), "help": text}));
+    }
     let output = match name {
         "memory_create" => {
             let memory_id = required_string(&arguments, "memory_id")?;
@@ -192,6 +197,12 @@ fn tool_definitions() -> Vec<Value> {
             vec!["memory_id"],
         ),
         tool(
+            "memory_help",
+            "Explain mineplan concepts and common operation sequences. Use topic overview, workflow, context, merge, or errors.",
+            json!({"topic":{"type":"string","enum":["overview","workflow","context","merge","errors"],"default":"overview"}}),
+            vec![],
+        ),
+        tool(
             "memory_record_thought",
             "Append a Thought. Premises are free text; changing them means creating a later Thought linked to its sources.",
             json!({"memory_id":{"type":"string"},"associated_from":{"type":"array","items":{"type":"string"},"default":[]},"premises":{"type":"array","items":{"type":"string"}}}),
@@ -264,6 +275,27 @@ fn tool_definitions() -> Vec<Value> {
             vec!["memory_id"],
         ),
     ]
+}
+
+fn help_text(topic: Option<&str>) -> Result<&'static str, (i32, String)> {
+    match topic.unwrap_or("overview") {
+        "overview" => Ok(
+            "mineplan は Thought を SQLite に保存する localhost 専用の記憶 MCP です。memory_create で記憶を作り、memory_record_thought で追記し、active_set を起点に memory_get_context で文脈を取得します。Thought は削除・上書きせず、前提を変えた場合は新しい Thought を作ります。",
+        ),
+        "workflow" => Ok(
+            "基本手順: 1) memory_create(memory_id) 2) memory_record_thought で最初の Thought を記録 3) memory_active_set_replace または memory_active_set_add で注目ノードを設定 4) memory_get_context で周辺文脈を取得 5) 新しい判断は memory_record_thought で関連元を associated_from に指定して追記します。",
+        ),
+        "context" => Ok(
+            "memory_get_context は active_set のアンカーから関連辺と associated_from 辺を双方向に探索します。limit は表示する通常ノードの件数です。統合ノードへの遷移はコスト0で limit を消費せず、統合元の内容は表示されません。active_set には同じ memory 内の既存ノードなら現在の表示範囲外でも指定できます。",
+        ),
+        "merge" => Ok(
+            "memory_thought_merge(memory_id, source_thought_id, target_thought_id) は source を非表示にし、source の辺を target へ統合経路として扱います。統合関係は SQLite に保存されます。存在しないノードや同一ノードは指定できません。",
+        ),
+        "errors" => Ok(
+            "ノード ID と memory_id は同じ記憶内に存在している必要があります。存在しない memory_id や Thought、重複した active anchor・関連・統合はエラーになります。エラーは JSON-RPC の error として返ります。",
+        ),
+        other => Err((-32602, format!("unknown help topic: {other}"))),
+    }
 }
 fn tool(name: &str, description: &str, properties: Value, required: Vec<&str>) -> Value {
     json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
