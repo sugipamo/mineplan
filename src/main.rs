@@ -173,7 +173,7 @@ ENVIRONMENT:
 
 MCP:
   POST http://127.0.0.1:3000/mcp
-  Tools: node_add, node_update, edge_add, edge_update, edge_delete, memory_focus"
+  Tools: add_node, update_node_name, update_node_memo, delete_node, add_edge, update_edge, delete_edge, add_sequence, focus"
 }
 
 fn app(state: AppState) -> Router {
@@ -268,23 +268,20 @@ mod tests {
             &app,
             mcp_request(
                 1,
-                "edge_add",
-                json!({"before":"前","after":"後","edge_name":"時系列として前後"}),
+                "add_edge",
+                json!({"edge_name":"next","from":"前","to":"後"}),
             ),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let response = call(
-            &app,
-            mcp_request(2, "memory_focus", json!({"focus":["後"]})),
-        )
-        .await;
+        let response = call(&app, mcp_request(2, "focus", json!({"focus":"後"}))).await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let response: Value = serde_json::from_slice(&body).unwrap();
         let output: Value =
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(output["before"], json!([["前"]]));
+        assert_eq!(output["focus"], "後");
+        assert_eq!(output["groups"], json!([]));
     }
 
     #[tokio::test]

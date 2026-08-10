@@ -6,8 +6,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 pub const DEFAULT_FOCUS_LIMIT: usize = 50;
-const CURRENT_SCHEMA_VERSION: i64 = 5;
-const LEGACY_REASON: &str = "未登録";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Order {
@@ -33,6 +31,7 @@ pub struct AddOrderResult {
 pub struct Memory {
     pub memory_id: String,
     pub notes: Vec<String>,
+    pub memos: HashMap<String, String>,
     pub orders: Vec<Order>,
 }
 
@@ -42,6 +41,8 @@ pub struct FocusView {
     pub before: Vec<Vec<String>>,
     pub focus: Vec<Vec<String>>,
     pub after: Vec<Vec<String>>,
+    pub named_groups: Vec<(String, Vec<Vec<String>>)>,
+    pub memos: HashMap<String, String>,
     pub connections: Vec<Order>,
     pub limit: usize,
     pub returned_notes: usize,
@@ -68,6 +69,12 @@ pub struct ClearResult {
     pub deleted_orders: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteNodeResult {
+    pub node_name: String,
+    pub deleted_edges: usize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
     #[error("memory_id must not be empty")]
@@ -90,8 +97,10 @@ pub enum MemoryError {
     UnknownNote(String),
     #[error("unknown edge: {0}")]
     UnknownEdge(i64),
-    #[error("database schema version {0} is newer than this program supports")]
-    UnsupportedSchemaVersion(i64),
+    #[error(
+        "existing database uses an incompatible mineplan schema; move or delete the database file before starting"
+    )]
+    IncompatibleDatabase,
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
 }
@@ -147,12 +156,69 @@ impl MemoryStore {
         validate_note(note)?;
         let sequence = next_note_sequence(&self.connection, memory_id)?;
         let added = self.connection.execute(
-            "INSERT OR IGNORE INTO ordered_notes (memory_id, content, sequence) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO ordered_notes (memory_id, content, memo, sequence) VALUES (?1, ?2, NULL, ?3)",
             params![memory_id, note, sequence],
         )? == 1;
         Ok(AddNoteResult {
             added,
             note: note.into(),
+        })
+    }
+
+    pub fn add_note_with_memo(
+        &mut self,
+        memory_id: &str,
+        note: &str,
+        memo: &str,
+    ) -> Result<AddNoteResult, MemoryError> {
+        self.ensure_memory(memory_id)?;
+        validate_note(note)?;
+        let sequence = next_note_sequence(&self.connection, memory_id)?;
+        let added = self.connection.execute(
+            "INSERT OR IGNORE INTO ordered_notes (memory_id, content, memo, sequence) VALUES (?1, ?2, ?3, ?4)",
+            params![memory_id, note, memo, sequence],
+        )? == 1;
+        Ok(AddNoteResult {
+            added,
+            note: note.into(),
+        })
+    }
+
+    pub fn update_note_memo(
+        &mut self,
+        memory_id: &str,
+        node_name: &str,
+        memo: &str,
+    ) -> Result<(), MemoryError> {
+        self.ensure_memory(memory_id)?;
+        self.ensure_note(memory_id, node_name)?;
+        self.connection.execute(
+            "UPDATE ordered_notes SET memo = ?1 WHERE memory_id = ?2 AND content = ?3",
+            params![memo, memory_id, node_name],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_note(
+        &mut self,
+        memory_id: &str,
+        node_name: &str,
+    ) -> Result<DeleteNodeResult, MemoryError> {
+        self.ensure_memory(memory_id)?;
+        self.ensure_note(memory_id, node_name)?;
+        let transaction = self.connection.transaction()?;
+        let deleted_edges = transaction.execute(
+            "DELETE FROM note_orders WHERE memory_id = ?1 AND (before_note = ?2 OR after_note = ?2)",
+            params![memory_id, node_name],
+        )?;
+        transaction.execute(
+            "DELETE FROM ordered_notes WHERE memory_id = ?1 AND content = ?2",
+            params![memory_id, node_name],
+        )?;
+        transaction.commit()?;
+        Ok(DeleteNodeResult {
+            node_name: node_name.into(),
+            deleted_edges,
         })
     }
 
@@ -219,6 +285,7 @@ impl MemoryStore {
         }
         let memory = self.get_memory(memory_id)?;
         let merged = memory.notes.iter().any(|note| note == to);
+        let from_memo = memory.memos.get(from).cloned().unwrap_or_default();
         let mut seen_notes = HashSet::new();
         let notes: Vec<String> = memory
             .notes
@@ -268,8 +335,17 @@ impl MemoryStore {
         )?;
         for (index, note) in notes.iter().enumerate() {
             transaction.execute(
-                "INSERT INTO ordered_notes (memory_id, content, sequence) VALUES (?1, ?2, ?3)",
-                params![memory_id, note, index as i64 + 1],
+                "INSERT INTO ordered_notes (memory_id, content, memo, sequence) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    memory_id,
+                    note,
+                    if note == to && !merged {
+                        Some(from_memo.as_str())
+                    } else {
+                        memory.memos.get(note).map(String::as_str)
+                    },
+                    index as i64 + 1
+                ],
             )?;
         }
         for (index, order) in orders.iter().enumerate() {
@@ -303,6 +379,7 @@ impl MemoryStore {
         Ok(Memory {
             memory_id: memory_id.into(),
             notes: self.load_notes(memory_id)?,
+            memos: self.load_memos(memory_id)?,
             orders: self.load_orders(memory_id)?,
         })
     }
@@ -440,10 +517,27 @@ impl MemoryStore {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    fn load_memos(&self, memory_id: &str) -> Result<HashMap<String, String>, MemoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT content, memo FROM ordered_notes WHERE memory_id = ?1 AND memo IS NOT NULL",
+        )?;
+        Ok(statement
+            .query_map(params![memory_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?)
+    }
+
     fn load_orders(&self, memory_id: &str) -> Result<Vec<Order>, MemoryError> {
         let mut statement = self.connection.prepare(
-            "SELECT edge_id, before_note, after_note, reason
-             FROM note_orders WHERE memory_id = ?1 ORDER BY sequence",
+            "SELECT note_orders.edge_id, note_orders.before_note, note_orders.after_note, note_orders.reason
+             FROM note_orders
+             JOIN ordered_notes AS before_nodes
+               ON before_nodes.memory_id = note_orders.memory_id AND before_nodes.content = note_orders.before_note
+             JOIN ordered_notes AS after_nodes
+               ON after_nodes.memory_id = note_orders.memory_id AND after_nodes.content = note_orders.after_note
+             WHERE note_orders.memory_id = ?1
+             ORDER BY note_orders.sequence",
         )?;
         Ok(statement
             .query_map(params![memory_id], |row| {
@@ -466,182 +560,40 @@ impl MemoryStore {
 }
 
 fn migrate_schema(connection: &mut Connection) -> Result<(), MemoryError> {
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS ordered_memory_schema_migrations (
-            version INTEGER PRIMARY KEY
-        )",
-        [],
-    )?;
-    let recorded: Option<i64> = connection.query_row(
-        "SELECT MAX(version) FROM ordered_memory_schema_migrations",
-        [],
-        |row| row.get(0),
-    )?;
-    let mut version = match recorded {
-        Some(version) => version,
-        None if table_exists(connection, "ordered_memories")? => {
-            if column_exists(connection, "note_orders", "reason")? {
-                if column_exists(connection, "note_orders", "edge_id")? {
-                    2
-                } else {
-                    3
-                }
-            } else {
-                1
-            }
-        }
-        None => 0,
-    };
-    if version > CURRENT_SCHEMA_VERSION {
-        return Err(MemoryError::UnsupportedSchemaVersion(version));
+    let has_old_schema = [
+        "ordered_memories",
+        "ordered_notes",
+        "note_orders",
+        "ordered_memory_schema_migrations",
+    ]
+    .into_iter()
+    .any(|table| table_exists(connection, table).unwrap_or(false));
+    if has_old_schema {
+        return Err(MemoryError::IncompatibleDatabase);
     }
-    if recorded.is_none() && version > 0 {
-        connection.execute(
-            "INSERT INTO ordered_memory_schema_migrations (version) VALUES (?1)",
-            params![version],
-        )?;
-    }
-    while version < CURRENT_SCHEMA_VERSION {
-        let next = version + 1;
-        let transaction = connection.transaction()?;
-        match next {
-            1 => create_v1_schema(&transaction)?,
-            2 => migrate_to_v2(&transaction)?,
-            3 => migrate_to_v3(&transaction)?,
-            4 => migrate_to_v4(&transaction)?,
-            5 => migrate_to_v5(&transaction)?,
-            _ => unreachable!(),
-        }
-        transaction.execute(
-            "INSERT INTO ordered_memory_schema_migrations (version) VALUES (?1)",
-            params![next],
-        )?;
-        transaction.commit()?;
-        version = next;
-    }
-    Ok(())
-}
-
-fn create_v1_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), MemoryError> {
-    transaction.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ordered_memories (
+    connection.execute_batch(
+        "CREATE TABLE ordered_memories (
             memory_id TEXT PRIMARY KEY
         );
-        CREATE TABLE IF NOT EXISTS ordered_notes (
+        CREATE TABLE ordered_notes (
             memory_id TEXT NOT NULL REFERENCES ordered_memories(memory_id),
             content TEXT NOT NULL,
+            memo TEXT,
             sequence INTEGER NOT NULL,
             PRIMARY KEY (memory_id, content),
             UNIQUE (memory_id, sequence)
         );
-        CREATE TABLE IF NOT EXISTS note_orders (
+        CREATE TABLE note_orders (
+            edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
             memory_id TEXT NOT NULL REFERENCES ordered_memories(memory_id),
             before_note TEXT NOT NULL,
             after_note TEXT NOT NULL,
+            reason TEXT NOT NULL,
             sequence INTEGER NOT NULL,
-            PRIMARY KEY (memory_id, before_note, after_note),
             UNIQUE (memory_id, sequence),
             FOREIGN KEY (memory_id, before_note) REFERENCES ordered_notes(memory_id, content),
             FOREIGN KEY (memory_id, after_note) REFERENCES ordered_notes(memory_id, content)
         );",
-    )?;
-    Ok(())
-}
-
-fn migrate_to_v2(transaction: &rusqlite::Transaction<'_>) -> Result<(), MemoryError> {
-    transaction.execute_batch(
-        "ALTER TABLE note_orders RENAME TO note_orders_v1;
-         CREATE TABLE note_orders (
-            memory_id TEXT NOT NULL REFERENCES ordered_memories(memory_id),
-            edge_id TEXT NOT NULL,
-            before_note TEXT NOT NULL,
-            after_note TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            PRIMARY KEY (memory_id, edge_id),
-            UNIQUE (memory_id, before_note, after_note, reason),
-            UNIQUE (memory_id, sequence),
-            FOREIGN KEY (memory_id, before_note) REFERENCES ordered_notes(memory_id, content),
-            FOREIGN KEY (memory_id, after_note) REFERENCES ordered_notes(memory_id, content)
-         );",
-    )?;
-    transaction.execute(
-        "INSERT INTO note_orders
-         (memory_id, edge_id, before_note, after_note, reason, sequence)
-         SELECT memory_id, 'E' || sequence, before_note, after_note, ?1, sequence
-         FROM note_orders_v1",
-        params![LEGACY_REASON],
-    )?;
-    transaction.execute("DROP TABLE note_orders_v1", [])?;
-    Ok(())
-}
-
-fn migrate_to_v3(transaction: &rusqlite::Transaction<'_>) -> Result<(), MemoryError> {
-    transaction.execute_batch(
-        "ALTER TABLE note_orders RENAME TO note_orders_v2;
-         CREATE TABLE note_orders (
-            memory_id TEXT NOT NULL REFERENCES ordered_memories(memory_id),
-            before_note TEXT NOT NULL,
-            after_note TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            PRIMARY KEY (memory_id, before_note, after_note, reason),
-            UNIQUE (memory_id, sequence),
-            FOREIGN KEY (memory_id, before_note) REFERENCES ordered_notes(memory_id, content),
-            FOREIGN KEY (memory_id, after_note) REFERENCES ordered_notes(memory_id, content)
-         );
-         INSERT INTO note_orders
-         (memory_id, before_note, after_note, reason, sequence)
-         SELECT memory_id, before_note, after_note, reason, sequence
-         FROM note_orders_v2;
-         DROP TABLE note_orders_v2;",
-    )?;
-    Ok(())
-}
-
-fn migrate_to_v4(transaction: &rusqlite::Transaction<'_>) -> Result<(), MemoryError> {
-    transaction.execute_batch(
-        "ALTER TABLE note_orders RENAME TO note_orders_v3;
-         CREATE TABLE note_orders (
-            edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            memory_id TEXT NOT NULL REFERENCES ordered_memories(memory_id),
-            before_note TEXT NOT NULL,
-            after_note TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            UNIQUE (memory_id, before_note, after_note, reason),
-            UNIQUE (memory_id, sequence),
-            FOREIGN KEY (memory_id, before_note) REFERENCES ordered_notes(memory_id, content),
-            FOREIGN KEY (memory_id, after_note) REFERENCES ordered_notes(memory_id, content)
-         );
-         INSERT INTO note_orders
-         (memory_id, before_note, after_note, reason, sequence)
-         SELECT memory_id, before_note, after_note, reason, sequence
-         FROM note_orders_v3 ORDER BY sequence;
-         DROP TABLE note_orders_v3;",
-    )?;
-    Ok(())
-}
-
-fn migrate_to_v5(transaction: &rusqlite::Transaction<'_>) -> Result<(), MemoryError> {
-    transaction.execute_batch(
-        "ALTER TABLE note_orders RENAME TO note_orders_v4;
-         CREATE TABLE note_orders (
-            edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            memory_id TEXT NOT NULL REFERENCES ordered_memories(memory_id),
-            before_note TEXT NOT NULL,
-            after_note TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            UNIQUE (memory_id, sequence),
-            FOREIGN KEY (memory_id, before_note) REFERENCES ordered_notes(memory_id, content),
-            FOREIGN KEY (memory_id, after_note) REFERENCES ordered_notes(memory_id, content)
-         );
-         INSERT INTO note_orders
-         (edge_id, memory_id, before_note, after_note, reason, sequence)
-         SELECT edge_id, memory_id, before_note, after_note, reason, sequence
-         FROM note_orders_v4 ORDER BY sequence;
-         DROP TABLE note_orders_v4;",
     )?;
     Ok(())
 }
@@ -655,15 +607,6 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool, MemoryErro
         )
         .optional()?
         .is_some())
-}
-
-fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool, MemoryError> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    Ok(statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == column))
 }
 
 fn next_note_sequence(connection: &Connection, memory_id: &str) -> Result<i64, MemoryError> {
@@ -691,15 +634,10 @@ fn ensure_note(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum Direction {
-    Before,
-    After,
-}
-
 fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusView {
+    let memos = memory.memos.clone();
     let (forward, reverse) = adjacency(&memory.orders);
-    let selected = bounded_selection(focus, limit, &forward, &reverse);
+    let (selected, named_nodes) = typed_bounded_selection(focus, limit, &memory.orders);
     let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
     let notes_truncated = selected.iter().any(|note| {
         forward
@@ -776,11 +714,26 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
             .map(|component| components[component].clone())
             .collect()
     };
+    let named_groups = named_nodes
+        .into_iter()
+        .map(|(edge_name, nodes)| {
+            let mut ids: Vec<usize> = components
+                .iter()
+                .enumerate()
+                .filter(|(_, component)| component.iter().any(|note| nodes.contains(note)))
+                .map(|(id, _)| id)
+                .collect();
+            ids.sort_by_key(|id| rank[*id]);
+            (edge_name, groups(ids))
+        })
+        .collect();
     FocusView {
         memory_id: memory.memory_id,
         before: groups(before_ids),
         focus: groups(focus_ids),
         after: groups(after_ids),
+        named_groups,
+        memos,
         connections,
         limit,
         returned_notes: selected.len(),
@@ -789,6 +742,42 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
         connections_truncated,
         truncated: notes_truncated || connections_truncated,
     }
+}
+
+fn typed_bounded_selection(
+    focus: &[String],
+    limit: usize,
+    orders: &[Order],
+) -> (Vec<String>, HashMap<String, HashSet<String>>) {
+    let mut selected = focus.to_vec();
+    let mut selected_set: HashSet<String> = focus.iter().cloned().collect();
+    let mut queue = VecDeque::new();
+    let mut groups: HashMap<String, HashSet<String>> = HashMap::new();
+    for note in focus {
+        for order in orders.iter().filter(|order| order.before == *note) {
+            queue.push_back((order.after.clone(), order.reason.clone()));
+        }
+    }
+    while let Some((note, edge_name)) = queue.pop_front() {
+        if !selected_set.contains(&note) {
+            if selected.len() == limit {
+                continue;
+            }
+            selected_set.insert(note.clone());
+            selected.push(note.clone());
+        }
+        groups
+            .entry(edge_name.clone())
+            .or_default()
+            .insert(note.clone());
+        for order in orders
+            .iter()
+            .filter(|order| order.before == note && order.reason == edge_name)
+        {
+            queue.push_back((order.after.clone(), edge_name.clone()));
+        }
+    }
+    (selected, groups)
 }
 
 fn adjacency(orders: &[Order]) -> (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) {
@@ -805,48 +794,6 @@ fn adjacency(orders: &[Order]) -> (HashMap<String, Vec<String>>, HashMap<String,
         }
     }
     (forward, reverse)
-}
-
-fn bounded_selection(
-    focus: &[String],
-    limit: usize,
-    forward: &HashMap<String, Vec<String>>,
-    reverse: &HashMap<String, Vec<String>>,
-) -> Vec<String> {
-    let mut selected = focus.to_vec();
-    let mut selected_set: HashSet<String> = focus.iter().cloned().collect();
-    let mut seen_before: HashSet<String> = focus.iter().cloned().collect();
-    let mut seen_after = seen_before.clone();
-    let mut queue = VecDeque::new();
-    for note in focus {
-        queue.push_back((note.clone(), Direction::Before));
-        queue.push_back((note.clone(), Direction::After));
-    }
-    while let Some((note, direction)) = queue.pop_front() {
-        if selected.len() == limit {
-            break;
-        }
-        let (neighbors, seen) = match direction {
-            Direction::Before => (reverse, &mut seen_before),
-            Direction::After => (forward, &mut seen_after),
-        };
-        for neighbor in neighbors.get(&note).into_iter().flatten() {
-            if !seen.insert(neighbor.clone()) {
-                continue;
-            }
-            if selected_set.contains(neighbor) {
-                queue.push_back((neighbor.clone(), direction));
-                continue;
-            }
-            if selected.len() == limit {
-                break;
-            }
-            selected_set.insert(neighbor.clone());
-            selected.push(neighbor.clone());
-            queue.push_back((neighbor.clone(), direction));
-        }
-    }
-    selected
 }
 
 fn connections_for_analysis(
@@ -1050,16 +997,29 @@ mod tests {
     }
 
     #[test]
+    fn deleting_node_removes_node_and_incident_edges() {
+        let mut store = store();
+        store.add_order("minecraft", "A", "B", "関係").unwrap();
+        let deleted = store.delete_note("minecraft", "B").unwrap();
+        assert_eq!(deleted.deleted_edges, 1);
+        let visible = store.focus("minecraft", &["A".into()], 50).unwrap();
+        assert!(visible.after.is_empty());
+        assert!(visible.connections.is_empty());
+        store.add_note("minecraft", "B").unwrap();
+        let fresh = store.focus("minecraft", &["A".into()], 50).unwrap();
+        assert!(fresh.after.is_empty());
+    }
+
+    #[test]
     fn cycles_become_local_sccs_and_can_be_cut_by_limit() {
         let mut store = store();
         store.add_order("minecraft", "A", "B", "AB").unwrap();
         store.add_order("minecraft", "B", "C", "BC").unwrap();
         store.add_order("minecraft", "C", "A", "CA").unwrap();
         let complete = store.focus("minecraft", &["A".into()], 3).unwrap();
-        assert_eq!(complete.focus, [vec!["A", "C", "B"]]);
-        assert!(!complete.notes_truncated);
+        assert_eq!(complete.focus, [vec!["A"]]);
+        assert!(complete.notes_truncated);
         let partial = store.focus("minecraft", &["A".into()], 2).unwrap();
-        assert_eq!(partial.before, [vec!["C"]]);
         assert_eq!(partial.focus, [vec!["A"]]);
         assert!(partial.notes_truncated);
     }
@@ -1076,8 +1036,7 @@ mod tests {
 
         let view = store.focus("minecraft", &["A".into()], 50).unwrap();
         assert_eq!(view.focus, [vec!["A", "B"]]);
-        assert!(view.before.is_empty());
-        assert!(view.after.is_empty());
+        assert_eq!(view.named_groups.len(), 1);
         assert_eq!(view.connections.len(), 2);
         assert_eq!(view.connections[0].reason, "AからBを見る理由");
         assert_eq!(view.connections[1].reason, "BからAを見る理由");
@@ -1095,12 +1054,11 @@ mod tests {
             .add_order("minecraft", "つるはし", "採掘", "使用")
             .unwrap();
         let view = store.focus("minecraft", &["棒".into()], 50).unwrap();
-        assert_eq!(view.before, [vec!["木"], vec!["板材"]]);
         assert_eq!(view.focus, [vec!["棒"]]);
-        assert_eq!(view.after, [vec!["つるはし"], vec!["採掘"]]);
-        assert_eq!(view.connections.len(), 4);
-        assert_eq!(view.returned_notes, 5);
-        assert!(!view.truncated);
+        assert_eq!(view.named_groups.len(), 1);
+        assert_eq!(view.connections.len(), 1);
+        assert_eq!(view.returned_notes, 2);
+        assert!(view.truncated);
     }
 
     #[test]
@@ -1112,9 +1070,8 @@ mod tests {
         let view = store
             .focus("minecraft", &["B".into(), "C".into()], 50)
             .unwrap();
-        assert_eq!(view.before, [vec!["A"]]);
         assert_eq!(view.focus, [vec!["B"], vec!["C"]]);
-        assert_eq!(view.after, [vec!["D"]]);
+        assert_eq!(view.named_groups.len(), 2);
     }
 
     #[test]
@@ -1123,8 +1080,7 @@ mod tests {
         store.add_order("minecraft", "A", "B", "AB").unwrap();
         store.add_note("minecraft", "unrelated").unwrap();
         let view = store.focus("minecraft", &["B".into()], 50).unwrap();
-        assert_eq!(view.before, [vec!["A"]]);
-        assert!(view.after.is_empty());
+        assert!(view.named_groups.is_empty());
     }
 
     #[test]
@@ -1137,8 +1093,7 @@ mod tests {
         let count_limited = store.focus("minecraft", &["C".into()], 3).unwrap();
         assert_eq!(count_limited.returned_notes, 3);
         assert!(count_limited.truncated);
-        assert_eq!(count_limited.before, [vec!["B"]]);
-        assert_eq!(count_limited.after, [vec!["D"]]);
+        assert_eq!(count_limited.focus, [vec!["C"]]);
         store
             .add_order("minecraft", "B", "C", "second reason")
             .unwrap();
@@ -1146,8 +1101,54 @@ mod tests {
             .add_order("minecraft", "B", "C", "third reason")
             .unwrap();
         let connection_limited = store.focus("minecraft", &["C".into()], 2).unwrap();
-        assert_eq!(connection_limited.returned_connections, 2);
-        assert!(connection_limited.connections_truncated);
+        assert_eq!(connection_limited.returned_connections, 1);
+        assert!(!connection_limited.connections_truncated);
+    }
+
+    #[test]
+    fn focus_continues_only_the_edge_name_used_to_arrive() {
+        let mut store = store();
+        store.add_order("minecraft", "A", "B", "before").unwrap();
+        store.add_order("minecraft", "B", "C", "before").unwrap();
+        store.add_order("minecraft", "B", "D", "depend_on").unwrap();
+        store.add_order("minecraft", "A", "E", "depend_on").unwrap();
+        store.add_order("minecraft", "E", "F", "depend_on").unwrap();
+
+        let view = store.focus("minecraft", &["A".into()], 50).unwrap();
+        let groups: HashMap<_, _> = view.named_groups.into_iter().collect();
+        assert_eq!(groups["before"], [vec!["B"], vec!["C"]]);
+        assert_eq!(groups["depend_on"], [vec!["E"], vec!["F"]]);
+        assert!(!groups["before"].iter().flatten().any(|node| node == "D"));
+    }
+
+    #[test]
+    fn node_memos_are_saved_updated_and_returned_by_focus() {
+        let mut store = store();
+        store
+            .add_note_with_memo("minecraft", "A", "最初のメモ")
+            .unwrap();
+        store
+            .add_note_with_memo("minecraft", "B", "周辺のメモ")
+            .unwrap();
+        store.add_order("minecraft", "A", "B", "related").unwrap();
+        store
+            .update_note_memo("minecraft", "A", "更新したメモ")
+            .unwrap();
+
+        let view = store.focus("minecraft", &["A".into()], 50).unwrap();
+        assert_eq!(view.memos["A"], "更新したメモ");
+        assert_eq!(view.memos["B"], "周辺のメモ");
+    }
+
+    #[test]
+    fn absent_and_empty_memos_are_distinct() {
+        let mut store = store();
+        store.add_note("minecraft", "未登録").unwrap();
+        store.add_note_with_memo("minecraft", "空文字", "").unwrap();
+        let view = store.focus("minecraft", &["未登録".into()], 50).unwrap();
+        assert!(!view.memos.contains_key("未登録"));
+        let view = store.focus("minecraft", &["空文字".into()], 50).unwrap();
+        assert_eq!(view.memos.get("空文字"), Some(&String::new()));
     }
 
     #[test]
@@ -1189,54 +1190,20 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_orders_without_losing_them() {
+    fn existing_database_schema_is_rejected_without_migration() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .unwrap();
-        {
-            let transaction = connection.transaction().unwrap();
-            create_v1_schema(&transaction).unwrap();
-            transaction.commit().unwrap();
-        }
-        connection
-            .execute("INSERT INTO ordered_memories (memory_id) VALUES ('m')", [])
-            .unwrap();
-        connection.execute("INSERT INTO ordered_notes (memory_id, content, sequence) VALUES ('m', 'A', 1), ('m', 'B', 2)", []).unwrap();
-        connection.execute("INSERT INTO note_orders (memory_id, before_note, after_note, sequence) VALUES ('m', 'A', 'B', 1)", []).unwrap();
-        migrate_schema(&mut connection).unwrap();
-        let reason: String = connection
-            .query_row(
-                "SELECT reason FROM note_orders WHERE memory_id = 'm'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(reason, LEGACY_REASON);
-        assert!(column_exists(&connection, "note_orders", "edge_id").unwrap());
         connection
             .execute(
-                "INSERT INTO note_orders (memory_id, before_note, after_note, reason, sequence)
-                 VALUES ('m', 'A', 'B', '未登録', 2)",
+                "CREATE TABLE ordered_memories (memory_id TEXT PRIMARY KEY)",
                 [],
             )
             .unwrap();
-        let edge_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM note_orders WHERE memory_id = 'm'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(edge_count, 2);
-        migrate_schema(&mut connection).unwrap();
-        let version: i64 = connection
-            .query_row(
-                "SELECT MAX(version) FROM ordered_memory_schema_migrations",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert!(matches!(
+            migrate_schema(&mut connection),
+            Err(MemoryError::IncompatibleDatabase)
+        ));
     }
 }

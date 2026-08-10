@@ -64,73 +64,131 @@ fn call_tool(
         .cloned()
         .unwrap_or_else(|| json!({}));
     let output = match name {
-        "node_add" => {
+        "add_node" => {
             let node_name = required_string(&arguments, "node_name")?;
-            store
-                .add_note(memory_id, node_name)
-                .map(|result| json!({"added":result.added}))
+            let result = match optional_string(&arguments, "memo")? {
+                Some(memo) => store.add_note_with_memo(memory_id, node_name, &memo),
+                None => store.add_note(memory_id, node_name),
+            }
+            .map_err(|error| (-32000, error.to_string()))?;
+            Ok(json!({"added":result.added}))
         }
-        "node_update" => {
+        "update_node_name" => {
             let from = required_string(&arguments, "from_node_name")?;
             let to = required_string(&arguments, "to_node_name")?;
-            store
+            let result = store
                 .rename_note(memory_id, from, to)
-                .map(|result| json!({"changed":result.changed,"merged":result.merged}))
+                .map_err(|error| (-32000, error.to_string()))?;
+            Ok(json!({"changed":result.changed,"merged":result.merged}))
         }
-        "edge_add" => {
-            let before = required_string(&arguments, "before")?;
-            let after = required_string(&arguments, "after")?;
-            let edge_name = required_string(&arguments, "edge_name")?;
+        "update_node_memo" => {
+            let node_name = required_string(&arguments, "node_name")?;
+            let memo = required_string_allow_empty(&arguments, "memo")?;
             store
-                .add_order(memory_id, before, after, edge_name)
+                .update_note_memo(memory_id, node_name, memo)
+                .map(|_| json!({"updated":true}))
+        }
+        "delete_node" => {
+            let node_name = required_string(&arguments, "node_name")?;
+            store
+                .delete_note(memory_id, node_name)
+                .map(|_| json!({"deleted":true}))
+        }
+        "add_edge" => {
+            let edge_name = required_string(&arguments, "edge_name")?;
+            let from = required_string(&arguments, "from")?;
+            let to = required_string(&arguments, "to")?;
+            store
+                .add_order(memory_id, from, to, edge_name)
                 .map(|result| json!({"added":result.added}))
         }
-        "edge_update" => {
+        "add_sequence" => {
+            let sequence = required_string_array(&arguments, "sequence")?;
+            if sequence.len() < 2 {
+                return Err((-32602, "sequence must contain at least two nodes".into()));
+            }
+            let edge_name = required_string(&arguments, "edge_name")?;
+            let reverse_edge_name = optional_string(&arguments, "reverse_edge_name")?;
+            let mut added_edges = 0usize;
+            for pair in sequence.windows(2) {
+                store
+                    .add_order(memory_id, &pair[0], &pair[1], edge_name)
+                    .map_err(|error| (-32000, error.to_string()))?;
+                added_edges += 1;
+                if let Some(reverse_edge_name) = reverse_edge_name.as_deref() {
+                    store
+                        .add_order(memory_id, &pair[1], &pair[0], reverse_edge_name)
+                        .map_err(|error| (-32000, error.to_string()))?;
+                    added_edges += 1;
+                }
+            }
+            Ok(json!({"added_edges":added_edges}))
+        }
+        "update_edge" => {
             let edge_id = required_i64(&arguments, "edge_id")?;
-            let before = optional_string(&arguments, "before")?;
-            let after = optional_string(&arguments, "after")?;
             let edge_name = optional_string(&arguments, "edge_name")?;
-            if before.is_none() && after.is_none() && edge_name.is_none() {
-                return Err((-32602, "edge_update requires a field to change".into()));
+            let from = optional_string(&arguments, "from")?;
+            let to = optional_string(&arguments, "to")?;
+            if edge_name.is_none() && from.is_none() && to.is_none() {
+                return Err((-32602, "update_edge requires a field to change".into()));
             }
             store
                 .update_order(
                     memory_id,
                     edge_id,
-                    before.as_deref(),
-                    after.as_deref(),
+                    from.as_deref(),
+                    to.as_deref(),
                     edge_name.as_deref(),
                 )
                 .map(|_| json!({"updated":true}))
         }
-        "edge_delete" => {
+        "delete_edge" => {
             let edge_id = required_i64(&arguments, "edge_id")?;
             store
                 .delete_order(memory_id, edge_id)
                 .map(|deleted| json!({"deleted":deleted}))
         }
-        "memory_focus" => {
-            let focus = required_string_list(&arguments, "focus")?;
+        "focus" => {
+            let focus = required_string(&arguments, "focus")?.to_owned();
             let limit = optional_usize(&arguments, "limit", DEFAULT_FOCUS_LIMIT)?;
-            store.focus(memory_id, &focus, limit).map(|view| {
+            let include_connections = optional_bool(&arguments, "include_connections", false)?;
+            store.focus(memory_id, std::slice::from_ref(&focus), limit).map(|view| {
                 let connections: Vec<Value> = view
                     .connections
                     .into_iter()
                     .map(|edge| {
-                        json!({
-                            "edge_id": edge.edge_id,
-                            "before": edge.before,
-                            "after": edge.after,
-                            "edge_name": edge.reason
-                        })
+                        json!({"edge_id": edge.edge_id, "edge_name": edge.reason, "from": edge.before, "to": edge.after})
                     })
                     .collect();
-                json!({
-                    "before": view.before,
-                    "focus": view.focus,
-                    "after": view.after,
-                    "connections": connections
-                })
+                let groups: Vec<Value> = view
+                    .named_groups
+                    .into_iter()
+                    .filter_map(|(edge_name, nodes)| {
+                        let nodes: Vec<Vec<String>> = nodes
+                            .into_iter()
+                            .map(|component| {
+                                component
+                                    .into_iter()
+                                    .filter(|node| node != &focus)
+                                    .collect()
+                            })
+                            .filter(|component: &Vec<String>| !component.is_empty())
+                            .collect();
+                        (!nodes.is_empty()).then(|| json!({"edge_name": edge_name, "nodes": nodes}))
+                    })
+                    .collect();
+                let mut output = json!({
+                    "focus": focus,
+                    "groups": groups,
+                    "memos": view
+                        .memos
+                        .into_iter()
+                        .collect::<std::collections::HashMap<_, _>>(),
+                });
+                if include_connections {
+                    output["connections"] = json!(connections);
+                }
+                output
             })
         }
         _ => return Err((-32602, format!("unknown tool: {name}"))),
@@ -153,7 +211,14 @@ fn required_string<'a>(value: &'a Value, name: &str) -> Result<&'a str, (i32, St
         .ok_or((-32602, format!("{name} must be a non-empty string")))
 }
 
-fn required_string_list(value: &Value, name: &str) -> Result<Vec<String>, (i32, String)> {
+fn required_string_allow_empty<'a>(value: &'a Value, name: &str) -> Result<&'a str, (i32, String)> {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or((-32602, format!("{name} must be a string")))
+}
+
+fn required_string_array(value: &Value, name: &str) -> Result<Vec<String>, (i32, String)> {
     value
         .get(name)
         .ok_or((-32602, format!("{name} is required")))?
@@ -198,42 +263,69 @@ fn optional_usize(value: &Value, name: &str, default: usize) -> Result<usize, (i
     }
 }
 
+fn optional_bool(value: &Value, name: &str, default: bool) -> Result<bool, (i32, String)> {
+    match value.get(name) {
+        None => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or((-32602, format!("{name} must be a boolean"))),
+    }
+}
+
 fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
-            "node_add",
-            "Add a free-text node by node_name. Repeating the call is safe and returns added=false.",
-            json!({"node_name":{"type":"string"}}),
+            "add_node",
+            "Add a free-text node by node_name, optionally with a memo. Repeating the call is safe and returns added=false.",
+            json!({"node_name":{"type":"string"},"memo":{"type":"string"}}),
             vec!["node_name"],
         ),
         tool(
-            "node_update",
-            "Change a node's string name. If the destination already exists, merge both nodes and rewire all edges. Exact duplicate edges remain separate.",
+            "update_node_name",
+            "Change a node's string name. Memo is not changed. If the destination already exists, merge both nodes and rewire all edges.",
             json!({"from_node_name":{"type":"string"},"to_node_name":{"type":"string"}}),
             vec!["from_node_name", "to_node_name"],
         ),
         tool(
-            "edge_add",
-            "Add one directed edge. Missing nodes are created automatically. edge_name is a label, not necessarily a fact. Reverse edges, cycles, and self-edges are valid.",
-            json!({"before":{"type":"string"},"after":{"type":"string"},"edge_name":{"type":"string"}}),
-            vec!["before", "after", "edge_name"],
+            "update_node_memo",
+            "Replace the memo attached to one node.",
+            json!({"node_name":{"type":"string"},"memo":{"type":"string"}}),
+            vec!["node_name", "memo"],
         ),
         tool(
-            "edge_update",
-            "Update an edge by its persistent edge_id. Any supplied before, after, or edge_name field is changed; omitted fields remain unchanged.",
-            json!({"edge_id":{"type":"integer","minimum":1},"before":{"type":"string"},"after":{"type":"string"},"edge_name":{"type":"string"}}),
+            "delete_node",
+            "Physically delete a node and all incident edges. Re-adding the same node_name does not restore the old edges.",
+            json!({"node_name":{"type":"string"}}),
+            vec!["node_name"],
+        ),
+        tool(
+            "add_edge",
+            "Add one named directed edge. Missing nodes are created automatically. Multiple edges between the same nodes are valid.",
+            json!({"edge_name":{"type":"string"},"from":{"type":"string"},"to":{"type":"string"}}),
+            vec!["edge_name", "from", "to"],
+        ),
+        tool(
+            "update_edge",
+            "Update an edge by its persistent edge_id. Any supplied edge_name, from, or to field is changed.",
+            json!({"edge_id":{"type":"integer","minimum":1},"edge_name":{"type":"string"},"from":{"type":"string"},"to":{"type":"string"}}),
             vec!["edge_id"],
         ),
         tool(
-            "edge_delete",
+            "delete_edge",
             "Delete one edge by its persistent edge_id. Node memories are not deleted.",
             json!({"edge_id":{"type":"integer","minimum":1}}),
             vec!["edge_id"],
         ),
         tool(
-            "memory_focus",
-            "Select at most limit nearby notes, analyze SCCs only within that local graph, and return before/focus/after as lists of SCC note lists. Connections are independently capped at limit.",
-            json!({"focus":{"type":"array","items":{"type":"string"},"minItems":1},"limit":{"type":"integer","minimum":0,"default":50}}),
+            "add_sequence",
+            "Add a linear sequence in the given order. For each adjacent pair, add the edge_name direction; when reverse_edge_name is supplied, also add the reverse direction.",
+            json!({"sequence":{"type":"array","items":{"type":"string"},"minItems":2},"edge_name":{"type":"string"},"reverse_edge_name":{"type":"string"}}),
+            vec!["sequence", "edge_name"],
+        ),
+        tool(
+            "focus",
+            "Select at most limit nearby notes from one focus node. Continue only edges with the same edge_name, and return SCC groups by edge_name. Set include_connections=true when edge IDs are needed for edge operations.",
+            json!({"focus":{"type":"string"},"limit":{"type":"integer","minimum":0,"default":50},"include_connections":{"type":"boolean","default":false}}),
             vec!["focus"],
         ),
     ]
@@ -256,12 +348,15 @@ mod tests {
         assert_eq!(
             names,
             [
-                "node_add",
-                "node_update",
-                "edge_add",
-                "edge_update",
-                "edge_delete",
-                "memory_focus"
+                "add_node",
+                "update_node_name",
+                "update_node_memo",
+                "delete_node",
+                "add_edge",
+                "update_edge",
+                "delete_edge",
+                "add_sequence",
+                "focus"
             ]
         );
     }
@@ -273,13 +368,18 @@ mod tests {
         for (id, name, arguments) in [
             (
                 1,
-                "edge_add",
-                json!({"before":"過去","after":"中心","edge_name":"中心より前の記録"}),
+                "add_edge",
+                json!({"edge_name":"next","from":"過去","to":"中心"}),
             ),
             (
                 2,
-                "edge_add",
-                json!({"before":"中心","after":"後続","edge_name":"中心より後の記録"}),
+                "add_edge",
+                json!({"edge_name":"next","from":"中心","to":"後続"}),
+            ),
+            (
+                3,
+                "add_edge",
+                json!({"edge_name":"next","from":"後続","to":"中心"}),
             ),
         ] {
             let response = handle_json_request(
@@ -292,26 +392,28 @@ mod tests {
         let response = handle_json_request(
             &mut store,
             "m",
-            &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_focus","arguments":{"focus":["中心"]}}}).to_string(),
+            &json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"focus","arguments":{"focus":"中心","include_connections":true}}}).to_string(),
         );
         assert!(response["result"].get("structuredContent").is_none());
         let view: Value =
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(view["before"], json!([["過去"]]));
-        assert_eq!(view["focus"], json!([["中心"]]));
-        assert_eq!(view["after"], json!([["後続"]]));
+        assert_eq!(view["focus"], "中心");
+        assert_eq!(
+            view["groups"],
+            json!([{"edge_name":"next","nodes":[["後続"]]}])
+        );
         assert_eq!(view["connections"].as_array().unwrap().len(), 2);
         assert!(view["connections"][0].get("edge_id").is_some());
-        assert_eq!(view["connections"][0]["edge_name"], "中心より前の記録");
+        assert_eq!(view["connections"][0]["edge_name"], "next");
         let edge_id = view["connections"][0]["edge_id"].as_i64().unwrap();
         for (id, name, arguments) in [
             (
-                4,
-                "edge_update",
-                json!({"edge_id":edge_id,"edge_name":"更新された辺"}),
+                5,
+                "update_edge",
+                json!({"edge_id":edge_id,"to":"更新された後続"}),
             ),
-            (5, "edge_delete", json!({"edge_id":edge_id})),
+            (6, "delete_edge", json!({"edge_id":edge_id})),
         ] {
             let response = handle_json_request(
                 &mut store,
@@ -323,5 +425,37 @@ mod tests {
         assert!(view.get("truncated").is_none());
         assert!(view.get("memory_id").is_none());
         assert!(view.get("limit").is_none());
+    }
+
+    #[test]
+    fn add_sequence_adds_forward_and_reverse_edges_for_each_adjacent_pair() {
+        let mut store = MemoryStore::open(":memory:").unwrap();
+        store.create_memory("m").unwrap();
+        let response = handle_json_request(
+            &mut store,
+            "m",
+            &json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{"name":"add_sequence","arguments":{
+                    "sequence":["A","B","C"],
+                    "edge_name":"next",
+                    "reverse_edge_name":"previous"
+                }}
+            })
+            .to_string(),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        let memory = store.get_memory("m").unwrap();
+        assert_eq!(memory.orders.len(), 4);
+        assert_eq!(memory.orders[0].before, "A");
+        assert_eq!(memory.orders[0].after, "B");
+        assert_eq!(memory.orders[1].before, "B");
+        assert_eq!(memory.orders[1].after, "A");
+        assert_eq!(memory.orders[2].before, "B");
+        assert_eq!(memory.orders[2].after, "C");
+        assert_eq!(memory.orders[3].before, "C");
+        assert_eq!(memory.orders[3].after, "B");
     }
 }

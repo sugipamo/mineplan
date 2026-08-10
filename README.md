@@ -1,11 +1,11 @@
 # mineplan
 
-自由文のメモと理由付きの前後関係をSQLiteへ保存し、指定したメモを中心として前提・過去と後続・未来を取り出す外部記憶MCPです。
+自由文のメモと名前付き有向辺をSQLiteへ保存し、指定したメモを起点として関係種別ごとの周辺を取り出す外部記憶MCPです。
 
-前後関係は、内容の真偽、タスクの完了、将来の予定を保証しません。ツールが保持するのは、呼び出し側が宣言した「このメモは、あのメモより前」という順序だけです。
+辺は、内容の真偽、タスクの完了、将来の予定を保証しません。ツールが保持するのは、呼び出し側が宣言した名前付きの関係だけです。
 
 ```text
-前提・過去 → フォーカス → 後続・未来
+フォーカス → 同じedge_nameの辺をたどる
 ```
 
 ## モデル
@@ -15,69 +15,108 @@
                               ↑ focus
 ```
 
-`棒を作る` をフォーカスにすると、次のように返ります。
+`棒を作る` をフォーカスにすると、関係種別ごとに次のように返ります。
 
 ```json
 {
-  "before": [
-    ["木を集める"],
-    ["板材を作る"]
-  ],
-  "focus": [
-    ["棒を作る"]
-  ],
-  "after": [
-    ["つるはしを作る"],
-    ["採掘に行く"]
+  "focus": "棒を作る",
+  "groups": [
+    {
+      "edge_name": "next",
+      "nodes": [["つるはしを作る"], ["採掘に行く"]]
+    }
   ],
   "connections": [
     {
       "edge_id": 1,
-      "before": "板材を作る",
-      "after": "棒を作る",
-      "edge_name": "棒の材料として板材を使うため"
+      "edge_name": "next",
+      "from": "棒を作る",
+      "to": "つるはしを作る"
     }
   ]
 }
 ```
 
-`before`、`focus`、`after` はすべて二重配列です。内側の配列は、取得した最大limit件の部分グラフ内で同じ強連結成分（SCC）に属するノード群です。前提側は遠いノード群からフォーカスへ、後続側はフォーカスから遠いノード群へ並びます。関係のないノードは含まれません。`connections` には表示範囲内の辺とedge_nameが入ります。
+`focus` は単一のノード名です。`groups[].nodes` は二重配列で、内側の配列は取得した部分グラフ内で同じSCCに属するノード群です。フォーカス自身はgroupsから除外されます。`groups` はedge_nameごとに返され、探索では同じedge_nameの辺だけを継続します。`connections` は通常省略され、`include_connections: true` の場合だけ `edge_id`、`edge_name`、`from`、`to` とともに返されます。
 
 ## MCPツール
 
 | ツール | 用途 |
 | --- | --- |
-| `node_add` | `node_name` を持つ自由文ノードを追加 |
-| `node_update` | ノード名を変更。変更先が存在すればノード統合 |
-| `edge_add` | `edge_name` 付きの `before → after` を追加。未知のノードは自動作成 |
-| `edge_update` | `edge_id` で辺を更新 |
-| `edge_delete` | `edge_id` で辺を削除 |
-| `memory_focus` | limit件のローカルグラフをSCC分析して取得 |
+| `add_node` | `node_name` を持つ自由文ノードを追加 |
+| `update_node_name` | ノード名を変更。memoは変更しない |
+| `update_node_memo` | ノードのmemoを更新 |
+| `delete_node` | ノードと接続辺を物理削除 |
+| `add_edge` | `edge_name` 付きの `from → to` を追加。未知のノードは自動作成 |
+| `add_sequence` | 指定順の隣接ノードへ辺を一括追加。任意で逆方向の辺も追加 |
+| `update_edge` | `edge_id` で辺を更新 |
+| `delete_edge` | `edge_id` で辺を削除 |
+| `focus` | limit件のローカルグラフをSCC分析して取得 |
 
-LLM向けMCPはこの6ツールを公開します。利用する記憶はサーバー起動時の `MEMORY_ID` で固定されるため、各ツールへ `memory_id` を渡す必要はありません。管理用HTTP APIと全件取得ツールは公開しません。
+LLM向けMCPはこの9ツールを公開します。利用する記憶はサーバー起動時の `MEMORY_ID` で固定されるため、各ツールへ `memory_id` を渡す必要はありません。管理用HTTP APIと全件取得ツールは公開しません。
 
-### 前後関係を記録する
+### ノードにmemoを付ける
+
+`add_node` は任意の `memo` を受け取ります。memoを変更する場合は `update_node_memo` を使います。
 
 ```json
 {
-  "name": "edge_add",
+  "name": "add_node",
   "arguments": {
-    "before": "板材を作る",
-    "after": "棒を作る",
-    "edge_name": "棒の材料として板材を使うため"
+    "node_name": "実装する",
+    "memo": "RustでMCPツールとして実装する"
   }
 }
 ```
 
-辺は永続的な `edge_id` で識別します。同じ `before`、`after`、`edge_name` の宣言を繰り返しても、それぞれ別の辺として保持され、新しい `edge_id` が発行されます。edge_nameが同じでも、逆方向や別の端点なら当然別の辺です。
+`focus` の応答では、memoが登録されているノードだけを `memos` に含めます。
 
-逆方向の辺も独立して登録できます。例えば `A → B` と `B → A` は、それぞれ固有のedge_nameを持つ2本の有向辺として保持されます。双方向辺、3ノード以上の循環、自己辺はいずれも正常な記憶です。`memory_focus` の取得範囲に循環全体が含まれる場合、それらのノードは同じSCCとして一つの内側配列にまとめられます。
+```json
+{
+  "focus": "実装する",
+  "memos": {
+    "実装する": "RustでMCPツールとして実装する"
+  }
+}
+```
+
+### 前後関係を記録する
+
+### タスク列を一括登録する
+
+```json
+{
+  "name": "add_sequence",
+  "arguments": {
+    "sequence": ["木を集める", "板材を作る", "棒を作る"],
+    "edge_name": "next",
+    "reverse_edge_name": "previous"
+  }
+}
+```
+
+`sequence` の順番どおりに、隣接する各ペアへ `edge_name` の辺を追加します。`reverse_edge_name` を指定した場合は逆方向の辺も追加します。3ノードなら順方向2本、逆方向を指定した場合は合計4本の辺が追加されます。未知のノードは自動作成され、多重辺も許可されます。
+
+```json
+{
+  "name": "add_edge",
+  "arguments": {
+    "edge_name": "next",
+    "from": "板材を作る",
+    "to": "棒を作る"
+  }
+}
+```
+
+辺は永続的な `edge_id` で識別します。同じ `edge_name`、`from`、`to` の宣言を繰り返しても、それぞれ別の辺として保持され、新しい `edge_id` が発行されます。
+
+逆方向の辺も独立して登録できます。例えば `A → B` と `B → A` は2本の有向辺として保持されます。双方向辺、3ノード以上の循環、自己辺はいずれも正常な記憶です。`focus` の取得範囲に循環全体が含まれる場合、それらのノードは同じSCCとして一つの内側配列にまとめられます。
 
 ### ノード名を変更する
 
 ```json
 {
-  "name": "node_update",
+  "name": "update_node_name",
   "arguments": {
     "from_node_name": "木材を集める",
     "to_node_name": "原木を集める"
@@ -87,23 +126,33 @@ LLM向けMCPはこの6ツールを公開します。利用する記憶はサー�
 
 `to` が未登録なら単純な改名です。既に存在する場合は両ノードを統合し、すべての辺を付け替えます。完全一致する辺が生じても自動統合せず、それぞれの `edge_id` を維持します。変更元ノードは物理削除されるため、この操作は実質的な削除を含みます。
 
+### ノードを削除する
+
+```json
+{
+  "name": "delete_node",
+  "arguments": {"node_name": "古い実装案"}
+}
+```
+
+`delete_node` はノードと、そのノードに接続する辺を物理削除します。同じ `node_name` を再登録しても、以前の辺は復活しません。この操作は取り消せません。
+
 ### 辺を更新・削除する
 
 ```json
 {
-  "name": "edge_update",
+  "name": "update_edge",
   "arguments": {
-    "edge_id": 14,
-    "edge_name": "つるはしの素材"
+    "edge_id": 14
   }
 }
 ```
 
-`before`、`after`、`edge_name` のうち指定した項目だけを更新します。辺を削除する場合は次のようにします。
+`edge_name`、`from`、`to` のうち指定した項目だけを更新します。辺を削除する場合は次のようにします。
 
 ```json
 {
-  "name": "edge_delete",
+  "name": "delete_edge",
   "arguments": {"edge_id": 14}
 }
 ```
@@ -114,35 +163,30 @@ LLM向けMCPはこの6ツールを公開します。利用する記憶はサー�
 
 ```json
 {
-  "name": "memory_focus",
+  "name": "focus",
   "arguments": {
-    "focus": ["棒を作る"],
-    "limit": 50
+    "focus": "棒を作る",
+    "limit": 50,
+    "include_connections": true
   }
 }
 ```
 
-`focus` は複数指定できます。前方向と後方向を近い順に探索し、明示フォーカスを含むユニークなメモを最大 `limit` 件取得します。既定値は50です。
+`focus` は1つ指定します。フォーカスから出る辺を、同じ `edge_name` の系列ごとに探索し、明示フォーカスを含むユニークなメモを最大 `limit` 件取得します。既定値は50です。
+
+`memos` に存在しないノードはmemo未登録です。`"memo": ""` を指定したノードは、空文字のmemoとして `memos` に含まれます。
 
 - SCC分析は全記憶ではなく、取得した部分グラフ内だけで行います。
-- limit途中で循環が切れた場合、見えている範囲だけでbefore／focus／afterを分類します。
+- 同じノードへ複数のedge_nameで到達した場合、それぞれの系列を継続します。
 - limitを増やすと、遠くの戻り辺が見えてSCC分類が変わることがあります。
 - `connections` も独立して最大limit件です。
 - 明示フォーカスの件数自体がlimitを超える場合はエラーです。
 
-MCP応答はLLMがそのまま読む前提で、JSONを `content` に一度だけ返します。書き込み結果は `added`、`changed` / `merged`、`updated`、`deleted` に絞り、`memory_focus` は `before`、`focus`、`after`、`connections` のみを返します。limitによる省略は通常動作として扱い、完全取得かどうかを示すフラグは返しません。
+MCP応答はLLMがそのまま読む前提で、JSONを `content` に一度だけ返します。書き込み結果は `added`、`changed` / `merged`、`updated`、`deleted` に絞り、`focus` は `focus`、`groups`、`connections` のみを返します。limitによる省略は通常動作として扱い、完全取得かどうかを示すフラグは返しません。
 
-## DBマイグレーション
+## DBスキーマ
 
-起動時に専用の `ordered_memory_schema_migrations` テーブルを確認し、必要な移行をトランザクション内で実行します。
-
-edge_nameが存在しなかった旧スキーマの辺は保持され、次の名前が設定されます。
-
-```text
-未登録
-```
-
-この移行は繰り返し起動しても再適用されません。プログラムより新しいDBスキーマを検出した場合は、破壊的な起動を避けるためエラーになります。
+新規DBは起動時に現行スキーマを作成します。既存のmineplan DBは互換対象外で、自動削除・自動移行せず起動エラーになります。必要な場合はDBファイルを利用者が退避または削除して、新しいDBを作成してください。
 
 ## 起動
 
