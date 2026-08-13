@@ -1,6 +1,6 @@
 # mineplan
 
-自由文のメモと名前付きの順序辺をSQLiteへ保存し、指定したメモを起点として関係種別ごとの前後を取り出す外部記憶MCPです。
+自由文ノードと名前付きの順序辺をSQLiteへ保存し、指定したノードを起点として関係種別ごとの前後を取り出す外部記憶MCPです。
 
 辺は、内容の真偽、タスクの完了、将来の予定を保証しません。ツールが保持するのは、呼び出し側が宣言した名前付きの関係だけです。
 
@@ -31,8 +31,26 @@ previous ← フォーカス → next
     {
       "edge_id": 1,
       "edge_name": "task",
+      "previous": "木を集める",
+      "next": "板材を作る"
+    },
+    {
+      "edge_id": 2,
+      "edge_name": "task",
+      "previous": "板材を作る",
+      "next": "棒を作る"
+    },
+    {
+      "edge_id": 3,
+      "edge_name": "task",
       "previous": "棒を作る",
       "next": "つるはしを作る"
+    },
+    {
+      "edge_id": 4,
+      "edge_name": "task",
+      "previous": "つるはしを作る",
+      "next": "採掘に行く"
     }
   ]
 }
@@ -49,12 +67,13 @@ previous ← フォーカス → next
 | `update_node_memo` | ノードのmemoを更新 |
 | `delete_node` | ノードと接続辺を物理削除 |
 | `add_edge` | `edge_name` 付きの `previous → next` を追加。両方向に探索可能 |
-| `add_sequence` | 指定順の隣接ノードへ前後探索可能な辺を一括追加 |
 | `update_edge` | `edge_id` で辺を更新 |
 | `delete_edge` | `edge_id` で辺を削除 |
+| `edge_to_node` | 1本の辺を、指定ノードを経由する同名の2辺へ置換 |
+| `add_sequence` | 指定順の隣接ノードへ前後探索可能な辺を一括追加 |
 | `focus` | limit件のローカルグラフをSCC分析して取得 |
 
-LLM向けMCPはこの9ツールを公開します。利用する記憶はサーバー起動時の `MEMORY_ID` で固定されるため、各ツールへ `memory_id` を渡す必要はありません。管理用HTTP APIと全件取得ツールは公開しません。
+LLM向けMCPはこの10ツールを公開します。利用する記憶はサーバー起動時の `MEMORY_ID` で固定されるため、各ツールへ `memory_id` を渡す必要はありません。管理用HTTP APIと全件取得ツールは公開しません。
 
 ### ノードにmemoを付ける
 
@@ -143,12 +162,13 @@ LLM向けMCPはこの9ツールを公開します。利用する記憶はサー�
 {
   "name": "update_edge",
   "arguments": {
-    "edge_id": 14
+    "edge_id": 14,
+    "edge_name": "task"
   }
 }
 ```
 
-`edge_name`、`previous`、`next` のうち指定した項目だけを更新します。辺を削除する場合は次のようにします。
+`edge_name`、`previous`、`next` のうち指定した項目だけを更新します。少なくとも1項目の指定が必要です。辺を削除する場合は次のようにします。
 
 ```json
 {
@@ -158,6 +178,27 @@ LLM向けMCPはこの9ツールを公開します。利用する記憶はサー�
 ```
 
 辺の削除は関係の宣言を撤回する操作であり、ノードや記憶全体は削除しません。
+
+### 辺の途中へノードを挿入する
+
+```json
+{
+  "name": "edge_to_node",
+  "arguments": {
+    "edge_id": 14,
+    "node_name": "忘れていたタスク"
+  }
+}
+```
+
+対象辺が `A ─task→ B` なら、これを削除して `A ─task→ 忘れていたタスク` と `忘れていたタスク ─task→ B` の2辺を作成します。元の `edge_name` を引き継ぎ、未知のノードは自動作成します。既存ノードを指定した場合、そのmemoと既存の接続は変更しません。多重辺があっても指定した `edge_id` だけが対象です。対象辺が存在しない場合は何も変更せずエラーになり、処理全体は一括で行われます。
+
+```json
+{
+  "removed_edge_id": 14,
+  "added_edge_ids": [20, 21]
+}
+```
 
 ### フォーカスを取得する
 
@@ -182,7 +223,7 @@ LLM向けMCPはこの9ツールを公開します。利用する記憶はサー�
 - `connections` も独立して最大limit件です。
 - 明示フォーカスの件数自体がlimitを超える場合はエラーです。
 
-MCP応答はLLMがそのまま読む前提で、JSONを `content` に一度だけ返します。書き込み結果は `added`、`changed` / `merged`、`updated`、`deleted` に絞り、`focus` は `focus`、`groups`、`connections` のみを返します。limitによる省略は通常動作として扱い、完全取得かどうかを示すフラグは返しません。
+MCP応答はLLMがそのまま読む前提で、JSONを `content` に一度だけ返します。通常の書き込み結果は `added`、`changed` / `merged`、`updated`、`deleted` に絞り、`edge_to_node` は置換前後の辺IDを返します。`focus` は `focus`、`groups`、memoがある場合の `memos`、要求時の `connections` を返します。limitによる省略は通常動作として扱い、完全取得かどうかを示すフラグは返しません。
 
 ## DBスキーマ
 
@@ -215,7 +256,7 @@ cargo run -- --help
 
 ```bash
 mineplan --version
-# mineplan v0.3.0
+# mineplan v0.5.0
 ```
 
 リリースバイナリにはビルド対象のGitタグを埋め込みます。ローカルビルドでは `git describe --tags --always --dirty` の結果を表示し、Git情報が利用できない場合だけCargoのパッケージバージョンへフォールバックします。

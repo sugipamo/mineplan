@@ -141,6 +141,16 @@ fn call_tool(
                 .delete_order(memory_id, edge_id)
                 .map(|deleted| json!({"deleted":deleted}))
         }
+        "edge_to_node" => {
+            let edge_id = required_i64(&arguments, "edge_id")?;
+            let node_name = required_string(&arguments, "node_name")?;
+            store
+                .edge_to_node(memory_id, edge_id, node_name)
+                .map(|result| json!({
+                    "removed_edge_id": result.removed_edge_id,
+                    "added_edge_ids": result.added_edge_ids
+                }))
+        }
         "focus" => {
             let focus = required_string(&arguments, "focus")?.to_owned();
             let limit = optional_usize(&arguments, "limit", DEFAULT_FOCUS_LIMIT)?;
@@ -322,6 +332,12 @@ fn tool_definitions() -> Vec<Value> {
             vec!["edge_id"],
         ),
         tool(
+            "edge_to_node",
+            "Replace one edge with two same-named edges through a node. The node is created when missing. The change is atomic.",
+            json!({"edge_id":{"type":"integer","minimum":1},"node_name":{"type":"string"}}),
+            vec!["edge_id", "node_name"],
+        ),
+        tool(
             "add_sequence",
             "Add a linear sequence in the given order. Each adjacent pair becomes one edge whose previous and next directions are both traversable.",
             json!({"sequence":{"type":"array","items":{"type":"string"},"minItems":2},"edge_name":{"type":"string"}}),
@@ -329,7 +345,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "focus",
-            "Select at most limit nearby notes from one focus node. Continue only edges with the same edge_name, and return SCC groups by edge_name. Set include_connections=true when edge IDs are needed for edge operations.",
+            "Select at most limit nearby notes from one focus node. Continue in the same previous or next direction and with the same edge_name, then return SCC groups by edge_name. Set include_connections=true when edge IDs are needed for edge operations.",
             json!({"focus":{"type":"string"},"limit":{"type":"integer","minimum":0,"default":50},"include_connections":{"type":"boolean","default":false}}),
             vec!["focus"],
         ),
@@ -360,6 +376,7 @@ mod tests {
                 "add_edge",
                 "update_edge",
                 "delete_edge",
+                "edge_to_node",
                 "add_sequence",
                 "focus"
             ]
@@ -452,5 +469,37 @@ mod tests {
         assert_eq!(memory.orders[0].next, "B");
         assert_eq!(memory.orders[1].previous, "B");
         assert_eq!(memory.orders[1].next, "C");
+    }
+
+    #[test]
+    fn edge_to_node_returns_replacement_edge_ids() {
+        let mut store = MemoryStore::open(":memory:").unwrap();
+        store.create_memory("m").unwrap();
+        let edge_id = store
+            .add_order("m", "A", "B", "task")
+            .unwrap()
+            .order
+            .edge_id;
+        let response = handle_json_request(
+            &mut store,
+            "m",
+            &json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{"name":"edge_to_node","arguments":{
+                    "edge_id":edge_id,
+                    "node_name":"X"
+                }}
+            })
+            .to_string(),
+        );
+        let output: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(output["removed_edge_id"], edge_id);
+        assert_eq!(output["added_edge_ids"].as_array().unwrap().len(), 2);
+        let memory = store.get_memory("m").unwrap();
+        assert_eq!(memory.orders.len(), 2);
     }
 }

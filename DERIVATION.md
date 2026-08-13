@@ -13,10 +13,10 @@
 - SQLiteによる永続状態
 - ID単位で独立したグラフ
 - 登録順を使った決定的な探索結果
-- MCPと読み取りAPIが同じストアを共有する構成
+- MCP処理が同じストアを共有する構成
 - インメモリSQLiteを使う単体・HTTPテスト
 - 外部Originを拒否するlocalhost前提
-- 起動時に段階的なスキーマ移行を行う構成
+- 起動時にスキーマを確認する構成
 
 ## 置き換えた特性
 
@@ -24,7 +24,7 @@
 | --- | --- |
 | Thoughtとpremise | 本文自体を識別子とする自由文note |
 | 無向の文脈探索 | 永続 `edge_id` と `edge_name` を持つ有向の前後関係 |
-| active_setを起点にBFS | 呼び出し時の複数focusから最大limit件を双方向探索 |
+| active_setを起点にBFS | 呼び出し時のfocusから最大limit件を方向・edge_name別に探索 |
 | 近傍のThought一覧 | edge_nameごとのprevious / next表示とローカルSCC |
 | Thought merge | String ID変更と既存ノードへの統合 |
 
@@ -33,7 +33,7 @@
 - Thoughtの追記専用履歴
 - active_set
 - 名前なしの無向関連
-- 双方向BFS
+- 名前なしの辺を区別せず往復するBFS
 - 全記憶を対象にしたSCC分析
 
 旧 `src/thought.rs`、`memory_viewer`、`experiments` は、現在のAPIと両立しないため削除しました。必要な由来情報はこの文書とライセンスに残しています。

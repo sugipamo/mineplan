@@ -173,7 +173,7 @@ ENVIRONMENT:
 
 MCP:
   POST http://127.0.0.1:3000/mcp
-  Tools: add_node, update_node_name, update_node_memo, delete_node, add_edge, update_edge, delete_edge, add_sequence, focus"
+  Tools: add_node, update_node_name, update_node_memo, delete_node, add_edge, update_edge, delete_edge, edge_to_node, add_sequence, focus"
 }
 
 fn app(state: AppState) -> Router {

@@ -29,6 +29,12 @@ pub struct AddOrderResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeToNodeResult {
+    pub removed_edge_id: i64,
+    pub added_edge_ids: [i64; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Memory {
     pub memory_id: String,
     pub notes: Vec<String>,
@@ -421,6 +427,50 @@ impl MemoryStore {
             "DELETE FROM note_orders WHERE memory_id = ?1 AND edge_id = ?2",
             params![memory_id, edge_id],
         )? == 1)
+    }
+
+    /// Replaces one edge with two edges of the same name through `node_name`.
+    pub fn edge_to_node(
+        &mut self,
+        memory_id: &str,
+        edge_id: i64,
+        node_name: &str,
+    ) -> Result<EdgeToNodeResult, MemoryError> {
+        self.ensure_memory(memory_id)?;
+        validate_note(node_name)?;
+        let current = self.load_order(memory_id, edge_id)?;
+        let transaction = self.connection.transaction()?;
+        ensure_note(&transaction, memory_id, node_name)?;
+        transaction.execute(
+            "DELETE FROM note_orders WHERE memory_id = ?1 AND edge_id = ?2",
+            params![memory_id, edge_id],
+        )?;
+        let mut added_edge_ids = [0; 2];
+        for (index, (previous, next)) in [
+            (current.previous.as_str(), node_name),
+            (node_name, current.next.as_str()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sequence: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM note_orders WHERE memory_id = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO note_orders
+                 (memory_id, previous_note, next_note, edge_name, sequence)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![memory_id, previous, next, current.edge_name, sequence],
+            )?;
+            added_edge_ids[index] = transaction.last_insert_rowid();
+        }
+        transaction.commit()?;
+        Ok(EdgeToNodeResult {
+            removed_edge_id: edge_id,
+            added_edge_ids,
+        })
     }
 
     /// Builds a bounded local graph around one or more notes, then classifies its SCCs.
@@ -1080,6 +1130,47 @@ mod tests {
             ["A", "B", "C"]
         );
         assert!(store.get_memory("minecraft").unwrap().orders.is_empty());
+    }
+
+    #[test]
+    fn edge_to_node_replaces_only_the_selected_edge_atomically() {
+        let mut store = store();
+        let selected = store.add_order("minecraft", "A", "B", "task").unwrap();
+        let duplicate = store.add_order("minecraft", "A", "B", "task").unwrap();
+        store
+            .add_note_with_memo("minecraft", "X", "existing memo")
+            .unwrap();
+
+        let result = store
+            .edge_to_node("minecraft", selected.order.edge_id, "X")
+            .unwrap();
+        assert_eq!(result.removed_edge_id, selected.order.edge_id);
+        assert_ne!(result.added_edge_ids[0], result.added_edge_ids[1]);
+
+        let memory = store.get_memory("minecraft").unwrap();
+        assert!(memory.notes.contains(&"X".into()));
+        assert_eq!(memory.memos["X"], "existing memo");
+        assert_eq!(memory.orders.len(), 3);
+        assert!(
+            memory
+                .orders
+                .iter()
+                .any(|edge| edge.edge_id == duplicate.order.edge_id)
+        );
+        assert!(
+            memory.orders.iter().any(|edge| {
+                edge.previous == "A" && edge.next == "X" && edge.edge_name == "task"
+            })
+        );
+        assert!(
+            memory.orders.iter().any(|edge| {
+                edge.previous == "X" && edge.next == "B" && edge.edge_name == "task"
+            })
+        );
+        assert!(matches!(
+            store.edge_to_node("minecraft", selected.order.edge_id, "Y"),
+            Err(MemoryError::UnknownEdge(id)) if id == selected.order.edge_id
+        ));
     }
 
     #[test]
