@@ -1,4 +1,4 @@
-//! SQLite-backed notes connected by acyclic before/after relations.
+//! SQLite-backed notes connected by named previous/next relations.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -6,13 +6,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 pub const DEFAULT_FOCUS_LIMIT: usize = 50;
+const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Order {
     pub edge_id: i64,
-    pub before: String,
-    pub after: String,
-    pub reason: String,
+    pub previous: String,
+    pub next: String,
+    pub edge_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,10 +39,8 @@ pub struct Memory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusView {
     pub memory_id: String,
-    pub before: Vec<Vec<String>>,
     pub focus: Vec<Vec<String>>,
-    pub after: Vec<Vec<String>>,
-    pub named_groups: Vec<(String, Vec<Vec<String>>)>,
+    pub named_groups: Vec<(String, Vec<Vec<String>>, Vec<Vec<String>>)>,
     pub memos: HashMap<String, String>,
     pub connections: Vec<Order>,
     pub limit: usize,
@@ -81,8 +80,8 @@ pub enum MemoryError {
     EmptyMemoryId,
     #[error("note must not be empty")]
     EmptyNote,
-    #[error("reason must not be empty")]
-    EmptyReason,
+    #[error("edge_name must not be empty")]
+    EmptyEdgeName,
     #[error("focus must contain at least one note")]
     EmptyFocus,
     #[error("duplicate focus note: {0}")]
@@ -208,7 +207,7 @@ impl MemoryStore {
         self.ensure_note(memory_id, node_name)?;
         let transaction = self.connection.transaction()?;
         let deleted_edges = transaction.execute(
-            "DELETE FROM note_orders WHERE memory_id = ?1 AND (before_note = ?2 OR after_note = ?2)",
+            "DELETE FROM note_orders WHERE memory_id = ?1 AND (previous_note = ?2 OR next_note = ?2)",
             params![memory_id, node_name],
         )?;
         transaction.execute(
@@ -222,21 +221,21 @@ impl MemoryStore {
         })
     }
 
-    /// Adds `before -> after`, creating either note when absent.
+    /// Adds `previous -> next`, creating either note when absent.
     pub fn add_order(
         &mut self,
         memory_id: &str,
-        before: &str,
-        after: &str,
-        reason: &str,
+        previous: &str,
+        next: &str,
+        edge_name: &str,
     ) -> Result<AddOrderResult, MemoryError> {
         self.ensure_memory(memory_id)?;
-        validate_note(before)?;
-        validate_note(after)?;
-        validate_reason(reason)?;
+        validate_note(previous)?;
+        validate_note(next)?;
+        validate_edge_name(edge_name)?;
         let transaction = self.connection.transaction()?;
-        ensure_note(&transaction, memory_id, before)?;
-        ensure_note(&transaction, memory_id, after)?;
+        ensure_note(&transaction, memory_id, previous)?;
+        ensure_note(&transaction, memory_id, next)?;
         let sequence: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM note_orders WHERE memory_id = ?1",
             params![memory_id],
@@ -244,9 +243,9 @@ impl MemoryStore {
         )?;
         transaction.execute(
             "INSERT INTO note_orders
-             (memory_id, before_note, after_note, reason, sequence)
+             (memory_id, previous_note, next_note, edge_name, sequence)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![memory_id, before, after, reason, sequence],
+            params![memory_id, previous, next, edge_name, sequence],
         )?;
         let edge_id = transaction.last_insert_rowid();
         transaction.commit()?;
@@ -254,15 +253,15 @@ impl MemoryStore {
             added: true,
             order: Order {
                 edge_id,
-                before: before.into(),
-                after: after.into(),
-                reason: reason.into(),
+                previous: previous.into(),
+                next: next.into(),
+                edge_name: edge_name.into(),
             },
         })
     }
 
     /// Changes a note's string identity. If `to` already exists, both nodes are merged.
-    /// Orders are rewired and exact `(before, after, reason)` duplicates are collapsed.
+    /// Orders are rewired and exact `(previous, next, edge_name)` duplicates are collapsed.
     pub fn rename_note(
         &mut self,
         memory_id: &str,
@@ -302,7 +301,7 @@ impl MemoryStore {
         let rewired_orders = memory
             .orders
             .iter()
-            .filter(|order| order.before == from || order.after == from)
+            .filter(|order| order.previous == from || order.next == from)
             .count();
         let original_order_count = memory.orders.len();
         let orders: Vec<Order> = memory
@@ -310,17 +309,17 @@ impl MemoryStore {
             .into_iter()
             .map(|order| Order {
                 edge_id: order.edge_id,
-                before: if order.before == from {
+                previous: if order.previous == from {
                     to.into()
                 } else {
-                    order.before
+                    order.previous
                 },
-                after: if order.after == from {
+                next: if order.next == from {
                     to.into()
                 } else {
-                    order.after
+                    order.next
                 },
-                reason: order.reason,
+                edge_name: order.edge_name,
             })
             .collect();
         let deduplicated_orders = original_order_count - orders.len();
@@ -351,14 +350,14 @@ impl MemoryStore {
         for (index, order) in orders.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO note_orders
-                 (edge_id, memory_id, before_note, after_note, reason, sequence)
+                 (edge_id, memory_id, previous_note, next_note, edge_name, sequence)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     order.edge_id,
                     memory_id,
-                    order.before,
-                    order.after,
-                    order.reason,
+                    order.previous,
+                    order.next,
+                    order.edge_name,
                     index as i64 + 1
                 ],
             )?;
@@ -388,31 +387,31 @@ impl MemoryStore {
         &mut self,
         memory_id: &str,
         edge_id: i64,
-        before: Option<&str>,
-        after: Option<&str>,
-        reason: Option<&str>,
+        previous: Option<&str>,
+        next: Option<&str>,
+        edge_name: Option<&str>,
     ) -> Result<Order, MemoryError> {
         self.ensure_memory(memory_id)?;
         let current = self.load_order(memory_id, edge_id)?;
-        let before = before.unwrap_or(&current.before);
-        let after = after.unwrap_or(&current.after);
-        let reason = reason.unwrap_or(&current.reason);
-        validate_note(before)?;
-        validate_note(after)?;
-        validate_reason(reason)?;
+        let previous = previous.unwrap_or(&current.previous);
+        let next = next.unwrap_or(&current.next);
+        let edge_name = edge_name.unwrap_or(&current.edge_name);
+        validate_note(previous)?;
+        validate_note(next)?;
+        validate_edge_name(edge_name)?;
         let transaction = self.connection.transaction()?;
-        ensure_note(&transaction, memory_id, before)?;
-        ensure_note(&transaction, memory_id, after)?;
+        ensure_note(&transaction, memory_id, previous)?;
+        ensure_note(&transaction, memory_id, next)?;
         transaction.execute(
-            "UPDATE note_orders SET before_note = ?1, after_note = ?2, reason = ?3 WHERE memory_id = ?4 AND edge_id = ?5",
-            params![before, after, reason, memory_id, edge_id],
+            "UPDATE note_orders SET previous_note = ?1, next_note = ?2, edge_name = ?3 WHERE memory_id = ?4 AND edge_id = ?5",
+            params![previous, next, edge_name, memory_id, edge_id],
         )?;
         transaction.commit()?;
         Ok(Order {
             edge_id,
-            before: before.into(),
-            after: after.into(),
-            reason: reason.into(),
+            previous: previous.into(),
+            next: next.into(),
+            edge_name: edge_name.into(),
         })
     }
 
@@ -530,12 +529,12 @@ impl MemoryStore {
 
     fn load_orders(&self, memory_id: &str) -> Result<Vec<Order>, MemoryError> {
         let mut statement = self.connection.prepare(
-            "SELECT note_orders.edge_id, note_orders.before_note, note_orders.after_note, note_orders.reason
+            "SELECT note_orders.edge_id, note_orders.previous_note, note_orders.next_note, note_orders.edge_name
              FROM note_orders
-             JOIN ordered_notes AS before_nodes
-               ON before_nodes.memory_id = note_orders.memory_id AND before_nodes.content = note_orders.before_note
-             JOIN ordered_notes AS after_nodes
-               ON after_nodes.memory_id = note_orders.memory_id AND after_nodes.content = note_orders.after_note
+             JOIN ordered_notes AS previous_nodes
+               ON previous_nodes.memory_id = note_orders.memory_id AND previous_nodes.content = note_orders.previous_note
+             JOIN ordered_notes AS next_nodes
+               ON next_nodes.memory_id = note_orders.memory_id AND next_nodes.content = note_orders.next_note
              WHERE note_orders.memory_id = ?1
              ORDER BY note_orders.sequence",
         )?;
@@ -543,9 +542,9 @@ impl MemoryStore {
             .query_map(params![memory_id], |row| {
                 Ok(Order {
                     edge_id: row.get(0)?,
-                    before: row.get(1)?,
-                    after: row.get(2)?,
-                    reason: row.get(3)?,
+                    previous: row.get(1)?,
+                    next: row.get(2)?,
+                    edge_name: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -553,13 +552,24 @@ impl MemoryStore {
 
     fn load_order(&self, memory_id: &str, edge_id: i64) -> Result<Order, MemoryError> {
         self.connection.query_row(
-            "SELECT edge_id, before_note, after_note, reason FROM note_orders WHERE memory_id = ?1 AND edge_id = ?2",
-            params![memory_id, edge_id], |row| Ok(Order { edge_id: row.get(0)?, before: row.get(1)?, after: row.get(2)?, reason: row.get(3)? }))
+            "SELECT edge_id, previous_note, next_note, edge_name FROM note_orders WHERE memory_id = ?1 AND edge_id = ?2",
+            params![memory_id, edge_id], |row| Ok(Order { edge_id: row.get(0)?, previous: row.get(1)?, next: row.get(2)?, edge_name: row.get(3)? }))
             .optional()?.ok_or(MemoryError::UnknownEdge(edge_id))
     }
 }
 
 fn migrate_schema(connection: &mut Connection) -> Result<(), MemoryError> {
+    if table_exists(connection, "mineplan_schema")? {
+        let version: i64 =
+            connection.query_row("SELECT version FROM mineplan_schema LIMIT 1", [], |row| {
+                row.get(0)
+            })?;
+        return if version == SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(MemoryError::IncompatibleDatabase)
+        };
+    }
     let has_old_schema = [
         "ordered_memories",
         "ordered_notes",
@@ -572,7 +582,11 @@ fn migrate_schema(connection: &mut Connection) -> Result<(), MemoryError> {
         return Err(MemoryError::IncompatibleDatabase);
     }
     connection.execute_batch(
-        "CREATE TABLE ordered_memories (
+        "CREATE TABLE mineplan_schema (
+            version INTEGER PRIMARY KEY
+        );
+        INSERT INTO mineplan_schema (version) VALUES (1);
+        CREATE TABLE ordered_memories (
             memory_id TEXT PRIMARY KEY
         );
         CREATE TABLE ordered_notes (
@@ -586,13 +600,13 @@ fn migrate_schema(connection: &mut Connection) -> Result<(), MemoryError> {
         CREATE TABLE note_orders (
             edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
             memory_id TEXT NOT NULL REFERENCES ordered_memories(memory_id),
-            before_note TEXT NOT NULL,
-            after_note TEXT NOT NULL,
-            reason TEXT NOT NULL,
+            previous_note TEXT NOT NULL,
+            next_note TEXT NOT NULL,
+            edge_name TEXT NOT NULL,
             sequence INTEGER NOT NULL,
             UNIQUE (memory_id, sequence),
-            FOREIGN KEY (memory_id, before_note) REFERENCES ordered_notes(memory_id, content),
-            FOREIGN KEY (memory_id, after_note) REFERENCES ordered_notes(memory_id, content)
+            FOREIGN KEY (memory_id, previous_note) REFERENCES ordered_notes(memory_id, content),
+            FOREIGN KEY (memory_id, next_note) REFERENCES ordered_notes(memory_id, content)
         );",
     )?;
     Ok(())
@@ -635,10 +649,20 @@ fn ensure_note(
 }
 
 fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusView {
-    let memos = memory.memos.clone();
+    let edge_name_rank: HashMap<String, usize> = memory
+        .orders
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| (edge.edge_name.clone(), index))
+        .collect();
     let (forward, reverse) = adjacency(&memory.orders);
     let (selected, named_nodes) = typed_bounded_selection(focus, limit, &memory.orders);
     let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
+    let memos = memory
+        .memos
+        .into_iter()
+        .filter(|(node, _)| selected_set.contains(node.as_str()))
+        .collect();
     let notes_truncated = selected.iter().any(|note| {
         forward
             .get(note)
@@ -651,8 +675,8 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
         .orders
         .into_iter()
         .filter(|order| {
-            selected_set.contains(order.before.as_str())
-                && selected_set.contains(order.after.as_str())
+            selected_set.contains(order.previous.as_str())
+                && selected_set.contains(order.next.as_str())
         })
         .collect();
     let all_connection_count = all_connections.len();
@@ -676,8 +700,8 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
             result
         },
     );
-    let before_distance = component_distances(&focus_components, &component_reverse);
-    let after_distance = component_distances(&focus_components, &component_forward);
+    let previous_distance = component_distances(&focus_components, &component_reverse);
+    let next_distance = component_distances(&focus_components, &component_forward);
     let rank: Vec<usize> = components
         .iter()
         .map(|component| {
@@ -688,50 +712,79 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
                 .expect("component is non-empty")
         })
         .collect();
-    let mut before_ids = Vec::new();
+    let mut previous_ids = Vec::new();
     let mut focus_ids = Vec::new();
-    let mut after_ids = Vec::new();
+    let mut next_ids = Vec::new();
     for component in 0..components.len() {
-        let reaches_focus = before_distance.contains_key(&component);
-        let reached_from_focus = after_distance.contains_key(&component);
+        let reaches_focus = previous_distance.contains_key(&component);
+        let reached_from_focus = next_distance.contains_key(&component);
         match (reaches_focus, reached_from_focus) {
             (true, true) => focus_ids.push(component),
-            (true, false) => before_ids.push(component),
-            (false, true) => after_ids.push(component),
+            (true, false) => previous_ids.push(component),
+            (false, true) => next_ids.push(component),
             (false, false) => {}
         }
     }
-    before_ids.sort_by_key(|component| {
+    previous_ids.sort_by_key(|component| {
         (
-            std::cmp::Reverse(before_distance[component]),
+            std::cmp::Reverse(previous_distance[component]),
             rank[*component],
         )
     });
     focus_ids.sort_by_key(|component| rank[*component]);
-    after_ids.sort_by_key(|component| (after_distance[component], rank[*component]));
+    next_ids.sort_by_key(|component| (next_distance[component], rank[*component]));
     let groups = |ids: Vec<usize>| {
         ids.into_iter()
             .map(|component| components[component].clone())
             .collect()
     };
-    let named_groups = named_nodes
+    let mut named_groups: Vec<_> = named_nodes
         .into_iter()
-        .map(|(edge_name, nodes)| {
-            let mut ids: Vec<usize> = components
+        .map(|(edge_name, directional_nodes)| {
+            let mut previous_ids: Vec<usize> = components
                 .iter()
                 .enumerate()
-                .filter(|(_, component)| component.iter().any(|note| nodes.contains(note)))
+                .filter(|(_, component)| {
+                    component
+                        .iter()
+                        .any(|note| directional_nodes.previous.contains(note))
+                })
                 .map(|(id, _)| id)
                 .collect();
-            ids.sort_by_key(|id| rank[*id]);
-            (edge_name, groups(ids))
+            let mut next_ids: Vec<usize> = components
+                .iter()
+                .enumerate()
+                .filter(|(_, component)| {
+                    component
+                        .iter()
+                        .any(|note| directional_nodes.next.contains(note))
+                })
+                .map(|(id, _)| id)
+                .collect();
+            previous_ids.sort_by_key(|component| {
+                (
+                    std::cmp::Reverse(previous_distance.get(component).copied().unwrap_or(0)),
+                    rank[*component],
+                )
+            });
+            next_ids.sort_by_key(|component| {
+                (
+                    next_distance.get(component).copied().unwrap_or(0),
+                    rank[*component],
+                )
+            });
+            (edge_name, groups(previous_ids), groups(next_ids))
         })
         .collect();
+    named_groups.sort_by_key(|(edge_name, _, _)| {
+        edge_name_rank
+            .get(edge_name.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
     FocusView {
         memory_id: memory.memory_id,
-        before: groups(before_ids),
         focus: groups(focus_ids),
-        after: groups(after_ids),
         named_groups,
         memos,
         connections,
@@ -744,21 +797,48 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
     }
 }
 
+#[derive(Default)]
+struct DirectionalNodes {
+    previous: HashSet<String>,
+    next: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum TraversalDirection {
+    Previous,
+    Next,
+}
+
 fn typed_bounded_selection(
     focus: &[String],
     limit: usize,
     orders: &[Order],
-) -> (Vec<String>, HashMap<String, HashSet<String>>) {
+) -> (Vec<String>, HashMap<String, DirectionalNodes>) {
     let mut selected = focus.to_vec();
     let mut selected_set: HashSet<String> = focus.iter().cloned().collect();
     let mut queue = VecDeque::new();
-    let mut groups: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut groups: HashMap<String, DirectionalNodes> = HashMap::new();
+    let mut seen: HashSet<(String, String, TraversalDirection)> = HashSet::new();
     for note in focus {
-        for order in orders.iter().filter(|order| order.before == *note) {
-            queue.push_back((order.after.clone(), order.reason.clone()));
+        for order in orders.iter().filter(|order| order.previous == *note) {
+            queue.push_back((
+                order.next.clone(),
+                order.edge_name.clone(),
+                TraversalDirection::Next,
+            ));
+        }
+        for order in orders.iter().filter(|order| order.next == *note) {
+            queue.push_back((
+                order.previous.clone(),
+                order.edge_name.clone(),
+                TraversalDirection::Previous,
+            ));
         }
     }
-    while let Some((note, edge_name)) = queue.pop_front() {
+    while let Some((note, edge_name, direction)) = queue.pop_front() {
+        if !seen.insert((note.clone(), edge_name.clone(), direction)) {
+            continue;
+        }
         if !selected_set.contains(&note) {
             if selected.len() == limit {
                 continue;
@@ -766,15 +846,21 @@ fn typed_bounded_selection(
             selected_set.insert(note.clone());
             selected.push(note.clone());
         }
-        groups
-            .entry(edge_name.clone())
-            .or_default()
-            .insert(note.clone());
-        for order in orders
-            .iter()
-            .filter(|order| order.before == note && order.reason == edge_name)
-        {
-            queue.push_back((order.after.clone(), edge_name.clone()));
+        let group = groups.entry(edge_name.clone()).or_default();
+        match direction {
+            TraversalDirection::Previous => group.previous.insert(note.clone()),
+            TraversalDirection::Next => group.next.insert(note.clone()),
+        };
+        for order in orders.iter().filter(|order| order.edge_name == edge_name) {
+            match direction {
+                TraversalDirection::Previous if order.next == note => {
+                    queue.push_back((order.previous.clone(), edge_name.clone(), direction))
+                }
+                TraversalDirection::Next if order.previous == note => {
+                    queue.push_back((order.next.clone(), edge_name.clone(), direction))
+                }
+                _ => {}
+            }
         }
     }
     (selected, groups)
@@ -784,13 +870,13 @@ fn adjacency(orders: &[Order]) -> (HashMap<String, Vec<String>>, HashMap<String,
     let mut forward: HashMap<String, Vec<String>> = HashMap::new();
     let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
     for order in orders {
-        let after = forward.entry(order.before.clone()).or_default();
-        if !after.contains(&order.after) {
-            after.push(order.after.clone());
+        let next = forward.entry(order.previous.clone()).or_default();
+        if !next.contains(&order.next) {
+            next.push(order.next.clone());
         }
-        let before = reverse.entry(order.after.clone()).or_default();
-        if !before.contains(&order.before) {
-            before.push(order.before.clone());
+        let previous = reverse.entry(order.next.clone()).or_default();
+        if !previous.contains(&order.previous) {
+            previous.push(order.previous.clone());
         }
     }
     (forward, reverse)
@@ -807,17 +893,17 @@ fn connections_for_analysis(
         .map(|(index, note)| (note.as_str(), index))
         .collect();
     let mut edges = Vec::new();
-    for before in note_order
+    for previous in note_order
         .iter()
         .filter(|note| selected.contains(note.as_str()))
     {
-        for after in forward.get(before).into_iter().flatten() {
-            if selected.contains(after.as_str()) {
-                edges.push((before.clone(), after.clone()));
+        for next in forward.get(previous).into_iter().flatten() {
+            if selected.contains(next.as_str()) {
+                edges.push((previous.clone(), next.clone()));
             }
         }
     }
-    edges.sort_by_key(|(before, after)| (rank[before.as_str()], rank[after.as_str()]));
+    edges.sort_by_key(|(previous, next)| (rank[previous.as_str()], rank[next.as_str()]));
     edges
 }
 
@@ -832,9 +918,9 @@ fn strongly_connected_components(
         .collect();
     let mut forward = vec![Vec::new(); selected.len()];
     let mut reverse = vec![Vec::new(); selected.len()];
-    for (before, after) in edges {
-        let from = index[before.as_str()];
-        let to = index[after.as_str()];
+    for (previous, next) in edges {
+        let from = index[previous.as_str()];
+        let to = index[next.as_str()];
         if !forward[from].contains(&to) {
             forward[from].push(to);
             reverse[to].push(from);
@@ -885,9 +971,9 @@ fn component_adjacency(
 ) -> (HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>) {
     let mut forward: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut reverse: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (before, after) in edges {
-        let from = component_of[before.as_str()];
-        let to = component_of[after.as_str()];
+    for (previous, next) in edges {
+        let from = component_of[previous.as_str()];
+        let to = component_of[next.as_str()];
         if from == to {
             continue;
         }
@@ -938,9 +1024,9 @@ fn validate_note(note: &str) -> Result<(), MemoryError> {
     }
 }
 
-fn validate_reason(reason: &str) -> Result<(), MemoryError> {
-    if reason.trim().is_empty() {
-        Err(MemoryError::EmptyReason)
+fn validate_edge_name(edge_name: &str) -> Result<(), MemoryError> {
+    if edge_name.trim().is_empty() {
+        Err(MemoryError::EmptyEdgeName)
     } else {
         Ok(())
     }
@@ -972,7 +1058,7 @@ mod tests {
         assert!(duplicate.added);
         assert_ne!(first.order.edge_id, duplicate.order.edge_id);
         assert!(another.added);
-        assert_ne!(first.order.reason, another.order.reason);
+        assert_ne!(first.order.edge_name, another.order.edge_name);
         assert_eq!(store.get_memory("minecraft").unwrap().orders.len(), 3);
     }
 
@@ -985,8 +1071,8 @@ mod tests {
             .update_order("minecraft", edge_id, None, Some("C"), Some("更新"))
             .unwrap();
         assert_eq!(updated.edge_id, edge_id);
-        assert_eq!(updated.after, "C");
-        assert_eq!(updated.reason, "更新");
+        assert_eq!(updated.next, "C");
+        assert_eq!(updated.edge_name, "更新");
         assert!(store.delete_order("minecraft", edge_id).unwrap());
         assert!(!store.delete_order("minecraft", edge_id).unwrap());
         assert_eq!(
@@ -1003,11 +1089,11 @@ mod tests {
         let deleted = store.delete_note("minecraft", "B").unwrap();
         assert_eq!(deleted.deleted_edges, 1);
         let visible = store.focus("minecraft", &["A".into()], 50).unwrap();
-        assert!(visible.after.is_empty());
+        assert!(visible.named_groups.is_empty());
         assert!(visible.connections.is_empty());
         store.add_note("minecraft", "B").unwrap();
         let fresh = store.focus("minecraft", &["A".into()], 50).unwrap();
-        assert!(fresh.after.is_empty());
+        assert!(fresh.named_groups.is_empty());
     }
 
     #[test]
@@ -1017,11 +1103,32 @@ mod tests {
         store.add_order("minecraft", "B", "C", "BC").unwrap();
         store.add_order("minecraft", "C", "A", "CA").unwrap();
         let complete = store.focus("minecraft", &["A".into()], 3).unwrap();
-        assert_eq!(complete.focus, [vec!["A"]]);
-        assert!(complete.notes_truncated);
+        assert_eq!(complete.focus, [vec!["A", "B", "C"]]);
+        assert!(!complete.notes_truncated);
         let partial = store.focus("minecraft", &["A".into()], 2).unwrap();
         assert_eq!(partial.focus, [vec!["A"]]);
         assert!(partial.notes_truncated);
+    }
+
+    #[test]
+    fn one_scc_can_appear_in_both_directions_of_the_same_edge_name() {
+        let mut store = store();
+        store.add_order("minecraft", "A", "B", "task").unwrap();
+        store.add_order("minecraft", "B", "C", "task").unwrap();
+        store.add_order("minecraft", "C", "A", "task").unwrap();
+
+        let view = store.focus("minecraft", &["A".into()], 50).unwrap();
+        let (edge_name, previous, next) = &view.named_groups[0];
+        assert_eq!(edge_name, "task");
+        assert_eq!(previous.len(), 1);
+        assert_eq!(next.len(), 1);
+        assert_eq!(previous[0], next[0]);
+        assert_eq!(previous[0].len(), 3);
+        assert!(
+            previous[0]
+                .iter()
+                .all(|node| ["A", "B", "C"].contains(&node.as_str()))
+        );
     }
 
     #[test]
@@ -1036,14 +1143,14 @@ mod tests {
 
         let view = store.focus("minecraft", &["A".into()], 50).unwrap();
         assert_eq!(view.focus, [vec!["A", "B"]]);
-        assert_eq!(view.named_groups.len(), 1);
+        assert_eq!(view.named_groups.len(), 2);
         assert_eq!(view.connections.len(), 2);
-        assert_eq!(view.connections[0].reason, "AからBを見る理由");
-        assert_eq!(view.connections[1].reason, "BからAを見る理由");
+        assert_eq!(view.connections[0].edge_name, "AからBを見る理由");
+        assert_eq!(view.connections[1].edge_name, "BからAを見る理由");
     }
 
     #[test]
-    fn focus_returns_uniform_scc_lists_in_before_focus_after_order() {
+    fn focus_returns_directional_scc_groups_in_order() {
         let mut store = store();
         store.add_order("minecraft", "木", "板材", "加工").unwrap();
         store.add_order("minecraft", "板材", "棒", "加工").unwrap();
@@ -1055,9 +1162,9 @@ mod tests {
             .unwrap();
         let view = store.focus("minecraft", &["棒".into()], 50).unwrap();
         assert_eq!(view.focus, [vec!["棒"]]);
-        assert_eq!(view.named_groups.len(), 1);
-        assert_eq!(view.connections.len(), 1);
-        assert_eq!(view.returned_notes, 2);
+        assert_eq!(view.named_groups.len(), 2);
+        assert_eq!(view.connections.len(), 3);
+        assert_eq!(view.returned_notes, 4);
         assert!(view.truncated);
     }
 
@@ -1071,7 +1178,7 @@ mod tests {
             .focus("minecraft", &["B".into(), "C".into()], 50)
             .unwrap();
         assert_eq!(view.focus, [vec!["B"], vec!["C"]]);
-        assert_eq!(view.named_groups.len(), 2);
+        assert_eq!(view.named_groups.len(), 3);
     }
 
     #[test]
@@ -1080,7 +1187,8 @@ mod tests {
         store.add_order("minecraft", "A", "B", "AB").unwrap();
         store.add_note("minecraft", "unrelated").unwrap();
         let view = store.focus("minecraft", &["B".into()], 50).unwrap();
-        assert!(view.named_groups.is_empty());
+        assert_eq!(view.named_groups.len(), 1);
+        assert_eq!(view.named_groups[0].1, [vec!["A"]]);
     }
 
     #[test]
@@ -1095,10 +1203,10 @@ mod tests {
         assert!(count_limited.truncated);
         assert_eq!(count_limited.focus, [vec!["C"]]);
         store
-            .add_order("minecraft", "B", "C", "second reason")
+            .add_order("minecraft", "B", "C", "second edge_name")
             .unwrap();
         store
-            .add_order("minecraft", "B", "C", "third reason")
+            .add_order("minecraft", "B", "C", "third edge_name")
             .unwrap();
         let connection_limited = store.focus("minecraft", &["C".into()], 2).unwrap();
         assert_eq!(connection_limited.returned_connections, 1);
@@ -1108,17 +1216,27 @@ mod tests {
     #[test]
     fn focus_continues_only_the_edge_name_used_to_arrive() {
         let mut store = store();
-        store.add_order("minecraft", "A", "B", "before").unwrap();
-        store.add_order("minecraft", "B", "C", "before").unwrap();
+        store.add_order("minecraft", "A", "B", "previous").unwrap();
+        store.add_order("minecraft", "B", "C", "previous").unwrap();
         store.add_order("minecraft", "B", "D", "depend_on").unwrap();
         store.add_order("minecraft", "A", "E", "depend_on").unwrap();
         store.add_order("minecraft", "E", "F", "depend_on").unwrap();
 
         let view = store.focus("minecraft", &["A".into()], 50).unwrap();
-        let groups: HashMap<_, _> = view.named_groups.into_iter().collect();
-        assert_eq!(groups["before"], [vec!["B"], vec!["C"]]);
-        assert_eq!(groups["depend_on"], [vec!["E"], vec!["F"]]);
-        assert!(!groups["before"].iter().flatten().any(|node| node == "D"));
+        let groups: HashMap<_, _> = view
+            .named_groups
+            .into_iter()
+            .map(|(edge_name, previous, next)| (edge_name, (previous, next)))
+            .collect();
+        assert_eq!(groups["previous"].1, [vec!["B"], vec!["C"]]);
+        assert_eq!(groups["depend_on"].1, [vec!["E"], vec!["F"]]);
+        assert!(
+            !groups["previous"]
+                .1
+                .iter()
+                .flatten()
+                .any(|node| node == "D")
+        );
     }
 
     #[test]
@@ -1169,21 +1287,21 @@ mod tests {
             [
                 Order {
                     edge_id: 1,
-                    before: "X".into(),
-                    after: "B".into(),
-                    reason: "incoming".into()
+                    previous: "X".into(),
+                    next: "B".into(),
+                    edge_name: "incoming".into()
                 },
                 Order {
                     edge_id: 2,
-                    before: "B".into(),
-                    after: "B".into(),
-                    reason: "same".into(),
+                    previous: "B".into(),
+                    next: "B".into(),
+                    edge_name: "same".into(),
                 },
                 Order {
                     edge_id: 3,
-                    before: "B".into(),
-                    after: "B".into(),
-                    reason: "same".into()
+                    previous: "B".into(),
+                    next: "B".into(),
+                    edge_name: "same".into()
                 }
             ]
         );
@@ -1205,5 +1323,12 @@ mod tests {
             migrate_schema(&mut connection),
             Err(MemoryError::IncompatibleDatabase)
         ));
+    }
+
+    #[test]
+    fn current_database_schema_can_be_opened_again() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_schema(&mut connection).unwrap();
+        migrate_schema(&mut connection).unwrap();
     }
 }

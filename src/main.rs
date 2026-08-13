@@ -269,7 +269,7 @@ mod tests {
             mcp_request(
                 1,
                 "add_edge",
-                json!({"edge_name":"next","from":"前","to":"後"}),
+                json!({"edge_name":"task","previous":"前","next":"後"}),
             ),
         )
         .await;
@@ -281,7 +281,10 @@ mod tests {
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
         assert_eq!(output["focus"], "後");
-        assert_eq!(output["groups"], json!([]));
+        assert_eq!(
+            output["groups"],
+            json!([{"edge_name":"task","previous":[["前"]],"next":[]}])
+        )
     }
 
     #[tokio::test]

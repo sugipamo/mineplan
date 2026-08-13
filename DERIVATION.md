@@ -25,7 +25,7 @@
 | Thoughtとpremise | 本文自体を識別子とする自由文note |
 | 無向の文脈探索 | 永続 `edge_id` と `edge_name` を持つ有向の前後関係 |
 | active_setを起点にBFS | 呼び出し時の複数focusから最大limit件を双方向探索 |
-| 近傍のThought一覧 | ローカルSCCによる二重配列のbefore / focus / after表示 |
+| 近傍のThought一覧 | edge_nameごとのprevious / next表示とローカルSCC |
 | Thought merge | String ID変更と既存ノードへの統合 |
 
 ## 引き継がなかった特性
