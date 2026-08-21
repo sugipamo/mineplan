@@ -7,6 +7,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use mineplan::mcp;
 use mineplan::ordered_memory::MemoryStore;
+use mineplan::path_mcp;
 use serde_json::{Value, json};
 use std::env;
 use std::io::{self, Write};
@@ -16,6 +17,8 @@ use std::sync::{Arc, Mutex};
 struct AppState {
     store: Arc<Mutex<MemoryStore>>,
     memory_id: String,
+    path_max_focus_calls: usize,
+    path_focus_limit: usize,
 }
 
 #[tokio::main]
@@ -43,12 +46,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn serve(database_path: &str, memory_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let port = env::var("MEMORY_HTTP_PORT").map_or(Ok(3000), |value| value.parse::<u16>())?;
+    let path_max_focus_calls =
+        env::var("PATH_MAX_FOCUS_CALLS").map_or(Ok(50), |value| value.parse::<usize>())?;
+    let path_focus_limit =
+        env::var("PATH_FOCUS_LIMIT").map_or(Ok(50), |value| value.parse::<usize>())?;
     let bind = format!("127.0.0.1:{port}");
     let mut store = MemoryStore::open(database_path)?;
     store.create_memory_if_missing(memory_id)?;
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         memory_id: memory_id.into(),
+        path_max_focus_calls,
+        path_focus_limit,
     };
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!("mineplan HTTP server: http://{bind}");
@@ -170,10 +179,12 @@ ENVIRONMENT:
   MEMORY_ID         Memory used by MCP tools (default: default)
   MEMORY_DB_PATH    SQLite database path (default: mineplan.sqlite3)
   MEMORY_HTTP_PORT  Local HTTP port (default: 3000)
+  PATH_MAX_FOCUS_CALLS  Maximum in-memory focus observations per path (default: 50)
+  PATH_FOCUS_LIMIT      Node and edge limit per path observation (default: 50)
 
 MCP:
   POST http://127.0.0.1:3000/mcp
-  Tools: add_node, update_node_name, update_node_memo, delete_node, add_edge, update_edge, delete_edge, edge_to_node, add_sequence, focus"
+  Tools: add_node, update_node_name, update_node_memo, delete_node, add_edge, update_edge, delete_edge, edge_to_node, add_sequence, focus, find_path"
 }
 
 fn app(state: AppState) -> Router {
@@ -189,6 +200,51 @@ async fn mcp_post(
 ) -> Response {
     if !origin_is_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if request.get("method").and_then(Value::as_str) == Some("tools/list") {
+        let mut response = match state.store.lock() {
+            Ok(mut store) => {
+                mcp::handle_json_request(&mut store, &state.memory_id, &request.to_string())
+            }
+            Err(_) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "memory store lock poisoned",
+                );
+            }
+        };
+        if let Some(tools) = response
+            .pointer_mut("/result/tools")
+            .and_then(Value::as_array_mut)
+        {
+            tools.push(path_mcp::tool_definition());
+        }
+        return Json(response).into_response();
+    }
+    if request.pointer("/params/name").and_then(Value::as_str) == Some("find_path")
+        && request.get("method").and_then(Value::as_str) == Some("tools/call")
+    {
+        let memory = match state.store.lock() {
+            Ok(store) => match store.get_memory(&state.memory_id) {
+                Ok(memory) => memory,
+                Err(error) => {
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                }
+            },
+            Err(_) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "memory store lock poisoned",
+                );
+            }
+        };
+        return Json(path_mcp::handle_json_request(
+            &memory,
+            state.path_max_focus_calls,
+            state.path_focus_limit,
+            request,
+        ))
+        .into_response();
     }
     match state.store.lock() {
         Ok(mut store) => Json(mcp::handle_json_request(
@@ -243,6 +299,8 @@ mod tests {
         app(AppState {
             store: Arc::new(Mutex::new(store)),
             memory_id: "default".into(),
+            path_max_focus_calls: 50,
+            path_focus_limit: 50,
         })
     }
 
@@ -257,6 +315,17 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn path_mcp_request(id: usize, from: &str, to: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"find_path","arguments":{"from":from,"to":to}}}).to_string(),
             ))
             .unwrap()
     }
@@ -285,6 +354,55 @@ mod tests {
             output["groups"],
             json!([{"edge_name":"task","previous":[["前"]],"next":[]}])
         )
+    }
+
+    #[tokio::test]
+    async fn find_path_uses_the_same_memory_through_the_main_endpoint() {
+        let app = test_app();
+        for (id, previous, next, edge_name) in
+            [(1, "A", "B", "x"), (2, "B", "C", "x"), (3, "C", "D", "y")]
+        {
+            let response = call(
+                &app,
+                mcp_request(
+                    id,
+                    "add_edge",
+                    json!({"edge_name":edge_name,"previous":previous,"next":next}),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = call(&app, path_mcp_request(4, "A", "D")).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        let output: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(output["turns"], 1);
+        assert_eq!(output["tasks"][0]["sequence"], json!(["A", "B", "C"]));
+        assert_eq!(output["tasks"][1]["sequence"], json!(["C", "D"]));
+    }
+
+    #[tokio::test]
+    async fn main_tools_list_includes_memory_and_path_tools() {
+        let response = call(
+            &test_app(),
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.last().unwrap()["name"], "find_path");
     }
 
     #[tokio::test]

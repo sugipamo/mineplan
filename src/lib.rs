@@ -2,3 +2,5 @@
 
 pub mod mcp;
 pub mod ordered_memory;
+pub mod path;
+pub mod path_mcp;

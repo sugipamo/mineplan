@@ -73,7 +73,47 @@ previous ← フォーカス → next
 | `add_sequence` | 指定順の隣接ノードへ前後探索可能な辺を一括追加 |
 | `focus` | limit件のローカルグラフをSCC分析して取得 |
 
-LLM向けMCPはこの10ツールを公開します。利用する記憶はサーバー起動時の `MEMORY_ID` で固定されるため、各ツールへ `memory_id` を渡す必要はありません。管理用HTTP APIと全件取得ツールは公開しません。
+LLM向けMCPは記憶操作10ツールと経路解析1ツールの計11ツールを公開します。利用する記憶はサーバー起動時の `MEMORY_ID` で固定されるため、各ツールへ `memory_id` を渡す必要はありません。管理用HTTP APIと全件取得ツールは公開しません。
+
+## 経路解析
+
+既存のMCP endpointに`find_path`を公開します。
+
+```text
+POST http://127.0.0.1:3000/mcp
+```
+
+```json
+{
+  "name": "find_path",
+  "arguments": {
+    "from": "要件を整理する",
+    "to": "リリースする"
+  }
+}
+```
+
+成功時は、`edge_name`を切り替える回数が少ない経路を返します。同じ`edge_name`が続く区間は1つのTaskになり、実際に通るノードが`sequence`へ並びます。
+
+```json
+{
+  "from": "A",
+  "to": "E",
+  "turns": 1,
+  "tasks": [
+    {"edge_name": "x", "sequence": ["A", "B", "C"]},
+    {"edge_name": "y", "sequence": ["C", "D", "E"]}
+  ]
+}
+```
+
+探索開始時にSQLiteから対象memoryのスナップショットを1回だけ取得します。その後はスナップショット上でfocus相当の観測を繰り返すため、探索中にDBを再読込せず、DBロックも保持しません。既定では最大50回、各回最大50ノード・50辺を観測します。
+
+```json
+{"from":"A","to":"E","found":false}
+```
+
+`found: false`は到達不能の証明ではなく、制限された観測範囲では経路が見つからなかったことを示します。
 
 ### ノードにmemoを付ける
 
@@ -243,6 +283,8 @@ cargo run
 MEMORY_ID=minecraft \
 MEMORY_DB_PATH=./data/memory.sqlite3 \
 MEMORY_HTTP_PORT=3001 \
+PATH_MAX_FOCUS_CALLS=50 \
+PATH_FOCUS_LIMIT=50 \
 cargo run
 ```
 

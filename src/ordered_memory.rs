@@ -499,7 +499,7 @@ impl MemoryStore {
             });
         }
         let memory = self.get_memory(memory_id)?;
-        Ok(analyze_local_focus(memory, focus, limit))
+        focus_memory(&memory, focus, limit)
     }
 
     pub fn clear_memory(&mut self, memory_id: &str) -> Result<ClearResult, MemoryError> {
@@ -698,7 +698,34 @@ fn ensure_note(
     Ok(())
 }
 
-fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusView {
+/// Runs focus analysis against an already loaded snapshot without accessing SQLite.
+pub fn focus_memory(
+    memory: &Memory,
+    focus: &[String],
+    limit: usize,
+) -> Result<FocusView, MemoryError> {
+    if focus.is_empty() {
+        return Err(MemoryError::EmptyFocus);
+    }
+    let mut focus_set = HashSet::new();
+    for note in focus {
+        if !focus_set.insert(note.as_str()) {
+            return Err(MemoryError::DuplicateFocus(note.clone()));
+        }
+        if !memory.notes.contains(note) {
+            return Err(MemoryError::UnknownNote(note.clone()));
+        }
+    }
+    if focus.len() > limit {
+        return Err(MemoryError::FocusExceedsLimit {
+            focus_notes: focus.len(),
+            limit,
+        });
+    }
+    Ok(analyze_local_focus(memory, focus, limit))
+}
+
+fn analyze_local_focus(memory: &Memory, focus: &[String], limit: usize) -> FocusView {
     let edge_name_rank: HashMap<String, usize> = memory
         .orders
         .iter()
@@ -710,8 +737,9 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
     let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
     let memos = memory
         .memos
-        .into_iter()
+        .iter()
         .filter(|(node, _)| selected_set.contains(node.as_str()))
+        .map(|(node, memo)| (node.clone(), memo.clone()))
         .collect();
     let notes_truncated = selected.iter().any(|note| {
         forward
@@ -723,11 +751,12 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
     });
     let all_connections: Vec<Order> = memory
         .orders
-        .into_iter()
+        .iter()
         .filter(|order| {
             selected_set.contains(order.previous.as_str())
                 && selected_set.contains(order.next.as_str())
         })
+        .cloned()
         .collect();
     let all_connection_count = all_connections.len();
     let connections_truncated = all_connection_count > limit;
@@ -833,7 +862,7 @@ fn analyze_local_focus(memory: Memory, focus: &[String], limit: usize) -> FocusV
             .unwrap_or(usize::MAX)
     });
     FocusView {
-        memory_id: memory.memory_id,
+        memory_id: memory.memory_id.clone(),
         focus: groups(focus_ids),
         named_groups,
         memos,
